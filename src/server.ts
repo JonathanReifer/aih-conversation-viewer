@@ -43,7 +43,7 @@ type LokiEntry = {
 type OtelTimelineEvent =
   | { kind: "prompt"; ts: string; text: string; sequence: number }
   | { kind: "api"; ts: string; model: string; cost: number; inputTokens: number; outputTokens: number; durationMs: number; cacheReadTokens: number }
-  | { kind: "tool"; ts: string; toolName: string; input: unknown; resultSizeBytes: number; success: boolean; decisionType: string }
+  | { kind: "tool"; ts: string; toolName: string; toolUseId: string; input: unknown; decision: string; executed: boolean; resultSizeBytes: number; success: boolean; durationMs: number }
   | { kind: "error"; ts: string; code: string; message: string };
 
 // ── Proxy / JSONL types ────────────────────────────────────────────────────
@@ -239,16 +239,42 @@ function buildOtelTimeline(events: LokiEntry[]): OtelTimelineEvent[] {
     return sa !== sb ? sa - sb : a.ts.localeCompare(b.ts);
   });
 
+  // Pass 1: index tool_result events by tool_use_id
+  const resultByToolUseId = new Map<string, LokiEntry>();
+  for (const e of sorted) {
+    if (e.body === "claude_code.tool_result") {
+      resultByToolUseId.set(String(e.attributes["tool_use_id"] ?? ""), e);
+    }
+  }
+
   const timeline: OtelTimelineEvent[] = [];
   for (const e of sorted) {
     if (e.body === "claude_code.user_prompt") {
       timeline.push({ kind: "prompt", ts: e.ts, text: String(e.attributes["prompt"] ?? ""), sequence: Number(e.attributes["event.sequence"] ?? 0) });
     } else if (e.body === "claude_code.api_request") {
       timeline.push({ kind: "api", ts: e.ts, model: String(e.attributes["model"] ?? "unknown"), cost: Number(e.attributes["cost_usd"] ?? 0), inputTokens: Number(e.attributes["input_tokens"] ?? 0), outputTokens: Number(e.attributes["output_tokens"] ?? 0), durationMs: Number(e.attributes["duration_ms"] ?? 0), cacheReadTokens: Number(e.attributes["cache_read_tokens"] ?? 0) });
-    } else if (e.body === "claude_code.tool_result" || e.body === "claude_code.tool_decision") {
-      let inputParsed: unknown = e.attributes["tool_input"];
+    } else if (e.body === "claude_code.tool_decision") {
+      // tool_decision fires for every invocation (approved/blocked/rejected/auto)
+      // Merge tool_result data when available (executed tools)
+      const toolUseId = String(e.attributes["tool_use_id"] ?? "");
+      const result = resultByToolUseId.get(toolUseId);
+      let inputParsed: unknown = result
+        ? result.attributes["tool_input"]
+        : e.attributes["tool_parameters"];
       try { inputParsed = JSON.parse(String(inputParsed)); } catch { /* keep string */ }
-      timeline.push({ kind: "tool", ts: e.ts, toolName: String(e.attributes["tool_name"] ?? "tool"), input: inputParsed, resultSizeBytes: Number(e.attributes["tool_result_size_bytes"] ?? 0), success: String(e.attributes["success"]) === "true", decisionType: String(e.attributes["decision_type"] ?? "accept") });
+      timeline.push({
+        kind: "tool",
+        ts: e.ts,
+        toolName: String(e.attributes["tool_name"] ?? "tool"),
+        toolUseId,
+        decision: String(e.attributes["decision"] ?? "accept"),
+        input: inputParsed,
+        executed: !!result,
+        resultSizeBytes: result ? Number(result.attributes["tool_result_size_bytes"] ?? 0) : 0,
+        success: result ? String(result.attributes["success"]) === "true" : false,
+        durationMs: result ? Number(result.attributes["duration_ms"] ?? 0) : 0,
+      });
+      // tool_result is consumed via the map — not emitted separately
     } else if (e.body === "claude_code.internal_error") {
       timeline.push({ kind: "error", ts: e.ts, code: String(e.attributes["error_code"] ?? e.body), message: String(e.attributes["error_name"] ?? "") });
     }
@@ -444,15 +470,24 @@ body { background: #0f0f1a; color: #e2e8f0; font-family: -apple-system, BlinkMac
 .tl-api .api-badge .model-name { color: #a78bfa; }
 .tl-api .api-badge .cost { color: #fbbf24; }
 
-.tl-tool { background: #1a1a2e; border: 1px solid #2a2a3e; border-radius: 8px; font-size: 12px; overflow: hidden; max-width: 520px; }
-.tl-tool.tool-blocked { border-color: #4a1a1a; }
+.tl-tool { background: #1a1a2e; border: 1px solid #2a2a3e; border-radius: 8px; font-size: 12px; overflow: hidden; max-width: 560px; }
+.tl-tool.tool-blocked { border-color: #4a1a1a; opacity: 0.8; }
+.tl-tool.tool-not-executed { opacity: 0.65; }
 .tl-tool .tool-header { padding: 5px 10px; background: #1e1e38; cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .tl-tool .tool-name { color: #a78bfa; font-weight: 600; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tl-tool .tool-decision { font-size: 10px; padding: 1px 5px; border-radius: 6px; white-space: nowrap; flex-shrink: 0; }
+.tl-tool .tool-decision.auto { background: #1a2a1a; color: #34d399; }
+.tl-tool .tool-decision.approved { background: #1a2a2a; color: #67e8f9; }
+.tl-tool .tool-decision.blocked { background: #3f1a1a; color: #fca5a5; }
+.tl-tool .tool-decision.rejected { background: #3f1a1a; color: #fca5a5; }
 .tl-tool .tool-preview { color: #64748b; font-size: 11px; font-family: monospace; flex: 2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tl-tool .tool-toggle { color: #4a5568; font-size: 10px; flex-shrink: 0; }
-.tl-tool .tool-body { padding: 8px 10px; font-family: monospace; color: #94a3b8; font-size: 11px; white-space: pre-wrap; overflow-x: auto; max-height: 240px; overflow-y: auto; display: none; }
+.tl-tool .tool-body { padding: 8px 10px; display: none; }
 .tl-tool .tool-body.open { display: block; }
 .tl-tool .tool-footer { padding: 4px 10px; font-size: 10px; color: #4a5568; border-top: 1px solid #2a2a3e; display: flex; gap: 8px; }
+.tb-section { margin-bottom: 8px; }
+.tb-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: #4a5568; margin-bottom: 3px; }
+.tb-value { margin: 0; font-size: 11px; font-family: monospace; color: #94a3b8; white-space: pre-wrap; word-break: break-all; background: #0f0f1a; border: 1px solid #1e1e30; border-radius: 4px; padding: 6px 8px; max-height: 200px; overflow-y: auto; display: block; }
 
 .tl-error { background: #1f0f0f; border: 1px solid #4a1a1a; border-radius: 8px; padding: 7px 12px; font-size: 12px; color: #fca5a5; font-family: monospace; }
 .tl-error .err-ts { font-size: 10px; color: #64748b; margin-bottom: 2px; }
@@ -633,7 +668,7 @@ function renderOtelEvent(ev) {
     return '<div class="tl-api"><div class="api-line"></div><div class="api-badge">✦ '+parts.join(' · ')+'</div><div class="api-line"></div></div>';
   }
   if (ev.kind === 'tool') {
-    return renderToolCard(ev.toolName, ev.input, ev.resultSizeBytes, ev.success, ev.decisionType, ev.ts);
+    return renderToolCard(ev.toolName, ev.input, ev.resultSizeBytes, ev.success, ev.decision, ev.ts, ev.durationMs, ev.executed);
   }
   if (ev.kind === 'error') {
     return '<div class="tl-error"><div class="err-ts">'+fmtTime(ev.ts)+'</div>⚠ '+esc(ev.code)+(ev.message?' · '+esc(ev.message):'')+'</div>';
@@ -641,38 +676,128 @@ function renderOtelEvent(ev) {
   return '';
 }
 
-function renderToolCard(toolName, input, resultSizeBytes, success, decisionType, ts) {
+function renderToolCard(toolName, input, resultSizeBytes, success, decision, ts, durationMs, executed) {
   const uid = 'tc-'+Math.random().toString(36).slice(2);
   const preview = extractToolPreview(toolName, input);
-  const blocked = decisionType === 'block' || decisionType === 'reject';
-  const icon = blocked ? '🚫' : (success===false ? '❌' : '🔧');
+  const d = (decision||'').toLowerCase();
+  const isBlocked = d==='block'||d==='reject'||d==='blocked'||d==='rejected';
+  const notExecuted = executed===false;
+  const decisionLabel = d==='auto'||d===''||d==='accept' ? 'auto'
+    : d==='block'||d==='blocked' ? 'blocked'
+    : d==='reject'||d==='rejected' ? 'rejected'
+    : d;
+  const icon = isBlocked ? '🚫' : (notExecuted ? '⏸' : (success===false ? '❌' : '🔧'));
+
   const footer = [
     ts ? fmtTime(ts) : null,
-    resultSizeBytes>0 ? 'result: '+fmtBytes(resultSizeBytes) : null,
-    decisionType && decisionType!=='accept' ? decisionType : null,
+    durationMs>0 ? (durationMs/1000).toFixed(2)+'s' : null,
+    resultSizeBytes>0 ? fmtBytes(resultSizeBytes)+' result' : null,
   ].filter(Boolean).join(' · ');
 
-  return '<div class="tl-tool'+(blocked?' tool-blocked':'')+'">'+
+  const cls = 'tl-tool'+(isBlocked?' tool-blocked':'')+(!executed&&executed!==undefined?' tool-not-executed':'');
+  const showDecisionBadge = decisionLabel!=='auto';
+
+  return '<div class="'+cls+'">'+
     '<div class="tool-header" onclick="toggleTool(\\\''+uid+'\\\')">'+
     '<span class="tool-name">'+icon+' '+esc(toolName)+'</span>'+
+    (showDecisionBadge ? '<span class="tool-decision '+esc(decisionLabel)+'">'+esc(decisionLabel)+'</span>' : '')+
     '<span class="tool-preview">'+esc(preview)+'</span>'+
     '<span class="tool-toggle">▾</span>'+
     '</div>'+
-    '<div class="tool-body" id="'+uid+'">'+esc(typeof input==='string'?input:JSON.stringify(input,null,2))+'</div>'+
+    '<div class="tool-body" id="'+uid+'">'+renderToolBody(toolName, input, null)+'</div>'+
     (footer?'<div class="tool-footer">'+esc(footer)+'</div>':'')+
     '</div>';
+}
+
+function renderPairedCard(callBlock, resultBlock) {
+  if (!callBlock) {
+    // orphan result with no matching call
+    return renderToolCard('result', null, 0, !resultBlock.is_error, 'accept', null, 0, true);
+  }
+  const uid = 'tc-'+Math.random().toString(36).slice(2);
+  const preview = extractToolPreview(callBlock.name||'tool', callBlock.input);
+  const isErr = resultBlock.is_error;
+  const resultText = Array.isArray(resultBlock.content)
+    ? resultBlock.content.map(b=>String(b.text||b.content||'')).join('\\n')
+    : String(resultBlock.content||'');
+  const icon = isErr ? '❌' : '🔧';
+
+  return '<div class="tl-tool'+(isErr?' tool-blocked':'')+'">'+
+    '<div class="tool-header" onclick="toggleTool(\\\''+uid+'\\\')">'+
+    '<span class="tool-name">'+icon+' '+esc(callBlock.name||'tool')+'</span>'+
+    '<span class="tool-preview">'+esc(preview)+'</span>'+
+    '<span class="tool-toggle">▾</span>'+
+    '</div>'+
+    '<div class="tool-body" id="'+uid+'">'+renderToolBody(callBlock.name||'tool', callBlock.input, resultText)+'</div>'+
+    '</div>';
+}
+
+function renderToolBody(toolName, input, resultText) {
+  const sections = [];
+  const i = input && typeof input==='object' ? input : {};
+
+  const n = (toolName||'').toLowerCase();
+  if (n==='bash') {
+    if (i.command) sections.push(['Command', String(i.command)]);
+    if (i.description) sections.push(['Description', String(i.description)]);
+  } else if (n==='read') {
+    if (i.file_path) sections.push(['File', String(i.file_path)]);
+    if (i.offset!=null) sections.push(['Offset', String(i.offset)]);
+    if (i.limit!=null) sections.push(['Limit', String(i.limit)]);
+  } else if (n==='write') {
+    if (i.file_path) sections.push(['File', String(i.file_path)]);
+    if (i.content) sections.push(['Content', String(i.content)]);
+  } else if (n==='edit'||n==='multiedit') {
+    if (i.file_path) sections.push(['File', String(i.file_path)]);
+    if (i.old_string) sections.push(['Find', String(i.old_string)]);
+    if (i.new_string) sections.push(['Replace', String(i.new_string)]);
+  } else if (n==='agent') {
+    if (i.description) sections.push(['Description', String(i.description)]);
+    if (i.prompt) sections.push(['Prompt', String(i.prompt)]);
+  } else if (n==='webfetch') {
+    if (i.url) sections.push(['URL', String(i.url)]);
+    if (i.prompt) sections.push(['Prompt', String(i.prompt)]);
+  } else if (n==='websearch') {
+    if (i.query) sections.push(['Query', String(i.query)]);
+  } else if (n==='glob'||n==='grep') {
+    const pat = i.pattern||i.query||i.glob||'';
+    if (pat) sections.push(['Pattern', String(pat)]);
+    if (i.path) sections.push(['Path', String(i.path)]);
+    if (i.include) sections.push(['Include', String(i.include)]);
+  } else if (n==='todoread'||n==='todowrite') {
+    if (i.todos) sections.push(['Todos', typeof i.todos==='string'?i.todos:JSON.stringify(i.todos,null,2)]);
+  } else {
+    // Generic: each top-level key as a labeled field
+    for (const [k,v] of Object.entries(i)) {
+      sections.push([k, typeof v==='string'?v:JSON.stringify(v,null,2)]);
+    }
+    // If input was a raw string
+    if (typeof input==='string'&&input) sections.push(['Input', input]);
+  }
+
+  if (resultText!=null) sections.push(['Result', resultText||'(empty)']);
+
+  if (!sections.length) return '<span style="color:#4a5568;font-style:italic">no detail</span>';
+
+  return sections.map(([label,val]) =>
+    '<div class="tb-section">'+
+    '<div class="tb-label">'+esc(String(label))+'</div>'+
+    '<pre class="tb-value">'+esc(String(val))+'</pre>'+
+    '</div>'
+  ).join('');
 }
 
 function extractToolPreview(name, input) {
   if (!input || typeof input !== 'object') return String(input||'').slice(0,80);
   const i = input;
-  if (name==='Bash'||name==='bash') return String(i.command||'').split('\\n')[0].slice(0,80);
-  if (name==='Read') return String(i.file_path||'');
-  if (name==='Write'||name==='Edit'||name==='MultiEdit') return String(i.file_path||'');
-  if (name==='Agent') return String(i.description||'');
-  if (name==='WebFetch') return String(i.url||'');
-  if (name==='WebSearch') return String(i.query||'');
-  if (name==='Glob'||name==='Grep') return String(i.pattern||i.query||'');
+  const n = (name||'').toLowerCase();
+  if (n==='bash') return String(i.command||'').split('\\n')[0].slice(0,80);
+  if (n==='read') return String(i.file_path||'');
+  if (n==='write'||n==='edit'||n==='multiedit') return String(i.file_path||'');
+  if (n==='agent') return String(i.description||'');
+  if (n==='webfetch') return String(i.url||'');
+  if (n==='websearch') return String(i.query||'');
+  if (n==='glob'||n==='grep') return String(i.pattern||i.query||i.glob||'');
   return JSON.stringify(i).slice(0,80);
 }
 
@@ -689,6 +814,15 @@ function renderProxyMessage(msg) {
 function renderContent(content) {
   if (typeof content === 'string') return esc(content);
   if (!Array.isArray(content)) return esc(JSON.stringify(content));
+
+  // Build lookup of tool_use blocks by id for pairing
+  const toolUseById = {};
+  for (const block of content) {
+    if (block && block.type === 'tool_use' && block.id) toolUseById[block.id] = block;
+  }
+  // Track which tool_use ids have been rendered as part of a pair
+  const consumed = new Set();
+
   return content.map(block => {
     if (!block || typeof block !== 'object') return '';
     if (block.type === 'text') {
@@ -697,21 +831,14 @@ function renderContent(content) {
       return '<span>'+esc(t)+'</span>';
     }
     if (block.type === 'tool_use') {
-      return renderToolCard(block.name||'tool', block.input, 0, true, 'accept', null);
+      if (consumed.has(block.id)) return ''; // already rendered inside its paired result card
+      // No result found yet — render as standalone call card
+      return renderToolCard(block.name||'tool', block.input, 0, true, 'accept', null, 0, undefined);
     }
     if (block.type === 'tool_result') {
-      const uid = 'tr-'+Math.random().toString(36).slice(2);
-      const c = Array.isArray(block.content) ? block.content.map(b=>String(b.text||'')).join('\\n') : String(block.content||'');
-      const preview = c.split('\\n')[0].slice(0,80);
-      const isErr = block.is_error;
-      return '<div class="tl-tool'+(isErr?' tool-blocked':'')+'">'+
-        '<div class="tool-header" onclick="toggleTool(\\\''+uid+'\\\')">'+
-        '<span class="tool-name">'+(isErr?'❌':'✅')+' result</span>'+
-        '<span class="tool-preview">'+esc(preview)+'</span>'+
-        '<span class="tool-toggle">▾</span>'+
-        '</div>'+
-        '<div class="tool-body" id="'+uid+'">'+esc(c)+'</div>'+
-        '</div>';
+      const call = toolUseById[block.tool_use_id];
+      if (call) consumed.add(call.id);
+      return renderPairedCard(call||null, block);
     }
     return '';
   }).filter(Boolean).join('');
