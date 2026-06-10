@@ -46,7 +46,7 @@ async function queryLoki(query: string, startNs: bigint, endNs: bigint, limit = 
   url.searchParams.set("start", startNs.toString());
   url.searchParams.set("end", endNs.toString());
   url.searchParams.set("limit", limit.toString());
-  url.searchParams.set("direction", "forward");
+  url.searchParams.set("direction", "backward");
 
   const res = await fetch(url.toString(), { signal: AbortSignal.timeout(10000) });
   if (!res.ok) return [];
