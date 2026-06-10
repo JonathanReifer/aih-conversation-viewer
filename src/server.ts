@@ -628,7 +628,7 @@ async function loadSession(id) {
   if (data.source === 'otel') {
     thread.innerHTML = data.events.map(renderOtelEvent).join('');
   } else if (data.source === 'proxy') {
-    thread.innerHTML = data.messages.map(renderProxyMessage).join('');
+    thread.innerHTML = data.messages.map(m=>renderProxyMessage(m,null)).join('');
   } else {
     // unified: proxy messages as base, OTEL events interleaved
     thread.innerHTML = renderUnified(data);
@@ -711,8 +711,25 @@ function renderToolCard(toolName, input, resultSizeBytes, success, decision, ts,
 
 function renderPairedCard(callBlock, resultBlock) {
   if (!callBlock) {
-    // orphan result with no matching call
-    return renderToolCard('result', null, 0, !resultBlock.is_error, 'accept', null, 0, true);
+    // Tool call is in a different message — render result-only card
+    const isErr = resultBlock.is_error;
+    const resultText = Array.isArray(resultBlock.content)
+      ? resultBlock.content.map(b=>String(b.text||b.content||'')).join('\\n')
+      : String(resultBlock.content||'');
+    const uid = 'tc-'+Math.random().toString(36).slice(2);
+    const preview = resultText.split('\\n')[0].slice(0,80);
+    return '<div class="tl-tool'+(isErr?' tool-blocked':'')+'">'+
+      '<div class="tool-header" onclick="toggleTool(\\\''+uid+'\\\')">'+
+      '<span class="tool-name">'+(isErr?'❌':'📤')+' result</span>'+
+      '<span class="tool-preview">'+esc(preview)+'</span>'+
+      '<span class="tool-toggle">▾</span>'+
+      '</div>'+
+      '<div class="tool-body" id="'+uid+'">'+
+      '<div class="tb-section"><div class="tb-label">Result</div>'+
+      '<pre class="tb-value">'+esc(resultText||'(empty)')+'</pre>'+
+      '</div>'+
+      '</div>'+
+      '</div>';
   }
   const uid = 'tc-'+Math.random().toString(36).slice(2);
   const preview = extractToolPreview(callBlock.name||'tool', callBlock.input);
@@ -805,18 +822,18 @@ function fmtBytes(n) { return n>1024?(n/1024).toFixed(1)+'kb':n+'b'; }
 
 // ── Proxy rendering ────────────────────────────────────────────────────────
 
-function renderProxyMessage(msg) {
-  const bodyHtml = renderContent(msg.content);
+function renderProxyMessage(msg, callMap) {
+  const bodyHtml = renderContent(msg.content, callMap);
   if (!bodyHtml.trim()) return '';
   return '<div class="msg '+msg.role+'"><div class="msg-role">'+msg.role+'</div><div class="bubble">'+bodyHtml+'</div></div>';
 }
 
-function renderContent(content) {
+function renderContent(content, extCallMap) {
   if (typeof content === 'string') return esc(content);
   if (!Array.isArray(content)) return esc(JSON.stringify(content));
 
-  // Build lookup of tool_use blocks by id for pairing
-  const toolUseById = {};
+  // Build lookup of tool_use blocks by id — seed from cross-message map if provided
+  const toolUseById = Object.assign({}, extCallMap||{});
   for (const block of content) {
     if (block && block.type === 'tool_use' && block.id) toolUseById[block.id] = block;
   }
@@ -873,7 +890,7 @@ function renderUnified(data) {
   // Render proxy messages; inject OTEL cost bars after assistant turns
   let lastAssistantMin = null;
   for (const msg of data.messages||[]) {
-    const rendered = renderProxyMessage(msg);
+    const rendered = renderProxyMessage(msg, null);
     if (!rendered) continue;
     html += rendered;
 
