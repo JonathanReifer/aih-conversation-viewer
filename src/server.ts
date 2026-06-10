@@ -1071,7 +1071,7 @@ function renderProxyMessage(msg, callMap) {
       : '';
     const isLong = text.length > 1000;
     const hasHeaders = /^#{1,3} /m.test(text);
-    const hasPaiHeaders = /════|NATIVE MODE|ALGORITHM|PAI \||@PAI\//m.test(text);
+    const hasPaiHeaders = /════|NATIVE MODE|ALGORITHM|PAI \\||@PAI\\//m.test(text);
     if (isLong && (hasHeaders || hasPaiHeaders)) {
       sourceLabel = '<span class="msg-source context">context</span>';
     } else if (text.length > 0 && text.length < 300 && !hasHeaders) {
