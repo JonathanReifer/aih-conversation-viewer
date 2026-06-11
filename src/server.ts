@@ -712,7 +712,8 @@ let activeSource = 'unified';
 let activeUser = null;
 let allExpanded = false;
 let allSessions = [];
-const hiddenKinds = new Set(JSON.parse(localStorage.getItem('hiddenKinds')||'[]'));
+localStorage.removeItem('hiddenKinds'); // clear stale toggle state from pre-fix sessions
+const hiddenKinds = new Set();
 
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function fmt(ts) { const d=new Date(ts); return d.toLocaleDateString()+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); }
@@ -862,7 +863,6 @@ function toggleKind(kind, btn) {
     document.body.classList.add(cls);
     btn.classList.remove('on');
   }
-  localStorage.setItem('hiddenKinds', JSON.stringify([...hiddenKinds]));
 }
 
 function toggleAll() {
@@ -1345,12 +1345,6 @@ document.addEventListener('keydown', e => {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 
-// Apply saved hidden kinds on load — set body classes and update button state
-hiddenKinds.forEach(kind => {
-  document.body.classList.add('hide-' + kind);
-  const btn = document.querySelector('#event-filters button[data-kind="' + kind + '"]');
-  if (btn) btn.classList.remove('on');
-});
 
 initDateRange();
 loadSessions();
