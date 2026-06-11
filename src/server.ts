@@ -656,7 +656,8 @@ mark.search-active { background: #f59e0b; color: #000; outline: 2px solid #f59e0
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
 /* Event kind visibility toggles — applied via body.hide-* classes */
-body.hide-prompt .tl-prompt { display: none !important; }
+body.hide-prompt .tl-prompt,
+body.hide-prompt .msg.user { display: none !important; }
 body.hide-api .tl-api,
 body.hide-api .otel-cost-bar { display: none !important; }
 body.hide-tool .tl-tool { display: none !important; }
