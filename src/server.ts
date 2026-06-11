@@ -35,6 +35,7 @@ type SessionSummary = {
 
 type LokiEntry = {
   ts: string;
+  tsNs: string; // raw nanosecond timestamp string (for pagination)
   body: string;
   attributes: Record<string, unknown>;
   level: "info" | "error";
@@ -157,7 +158,7 @@ async function queryLoki(query: string, startNs: bigint, endNs: bigint, limit = 
   url.searchParams.set("limit", limit.toString());
   url.searchParams.set("direction", "backward");
 
-  const res = await fetch(url.toString(), { signal: AbortSignal.timeout(10000) });
+  const res = await fetch(url.toString(), { signal: AbortSignal.timeout(15000) });
   if (!res.ok) return [];
   const data = await res.json() as { status: string; data: { result: { stream: Record<string, string>; values: [string, string][] }[] } };
   if (data.status !== "success") return [];
@@ -169,6 +170,7 @@ async function queryLoki(query: string, startNs: bigint, endNs: bigint, limit = 
       try {
         const parsed = JSON.parse(line) as { body?: string; attributes?: Record<string, unknown> };
         entries.push({
+          tsNs,
           ts: new Date(Number(BigInt(tsNs) / 1_000_000n)).toISOString(),
           body: String(parsed.body ?? ""),
           attributes: parsed.attributes ?? {},
@@ -180,14 +182,33 @@ async function queryLoki(query: string, startNs: bigint, endNs: bigint, limit = 
   return entries;
 }
 
+// Paginated fetch — makes multiple 5000-entry Loki queries (sliding backward) until all events are
+// collected. Loki's server-side max is 5000/query; without pagination, sessions > ~2k events lose
+// their earliest data because newer sessions consume the quota.
 async function fetchOtelEvents(userFilter?: string, startTs?: string, endTs?: string): Promise<LokiEntry[]> {
   const nowNs = BigInt(Date.now()) * 1_000_000n;
   const startNs = startTs
     ? BigInt(new Date(startTs).getTime()) * 1_000_000n
     : nowNs - BigInt(LOOKBACK_DAYS) * 86_400_000_000_000n;
-  const endNs = endTs ? BigInt(new Date(endTs + 'T23:59:59Z').getTime()) * 1_000_000n : nowNs;
-  const events = await queryLoki(`{job="claude-code"}`, startNs, endNs);
-  return userFilter ? events.filter((e) => e.attributes["user.email"] === userFilter) : events;
+
+  const PAGE = 5000;
+  const MAX_PAGES = 20; // hard cap: 100k events
+  const all: LokiEntry[] = [];
+  let curEnd = endTs ? BigInt(new Date(endTs + 'T23:59:59Z').getTime()) * 1_000_000n : nowNs;
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const batch = await queryLoki(`{job="claude-code"}`, startNs, curEnd, PAGE);
+    if (!batch.length) break;
+    all.push(...batch);
+    if (batch.length < PAGE) break; // got all events in window
+
+    // Oldest entry in this page (direction=backward → last in array)
+    const oldestNs = BigInt(batch[batch.length - 1].tsNs);
+    if (oldestNs <= startNs) break;
+    curEnd = oldestNs - 1n; // set next end to just before oldest
+  }
+
+  return userFilter ? all.filter((e) => e.attributes["user.email"] === userFilter) : all;
 }
 
 type OtelSession = {
@@ -1134,6 +1155,11 @@ function renderContent(content, extCallMap) {
 // ── Unified rendering ──────────────────────────────────────────────────────
 
 function renderUnified(data) {
+  // OTEL-only session (no proxy messages) — fall back to full OTEL timeline
+  if ((!data.messages || data.messages.length === 0) && data.otelEvents && data.otelEvents.length > 0) {
+    return data.otelEvents.map(renderOtelEvent).join('') || '<div class="empty">No content</div>';
+  }
+
   let html = '';
 
   // Group OTEL api events by rough time for cost overlay
