@@ -832,7 +832,7 @@ async function loadSession(id) {
     ' <span class="session-id" title="click to copy" onclick="copyId(\\\''+id+'\\\')">'+(data.otelId||id).slice(0,8)+'…</span>'+
     (data.piiCount>0||true ? ' <button id="pii-nav-btn" class="btn" onclick="nextPii()">🔒</button>' : '')+
     ' <button class="btn" onclick="toggleSearch()">🔍</button>'+
-    ' <button class="btn" onclick="toggleAll()">Expand all</button>';
+    ' <button id="expand-btn" class="btn" onclick="toggleAll()">Expand all</button>';
 
   document.getElementById('event-filters').classList.toggle('active', data.source==='otel'||data.source==='unified');
 
@@ -868,7 +868,8 @@ function toggleKind(kind, btn) {
 function toggleAll() {
   allExpanded = !allExpanded;
   document.querySelectorAll('.tool-body').forEach(el => el.classList.toggle('open', allExpanded));
-  document.querySelector('#thread-header .btn').textContent = allExpanded ? 'Collapse all' : 'Expand all';
+  const expandBtn = document.getElementById('expand-btn');
+  if (expandBtn) expandBtn.textContent = allExpanded ? 'Collapse all' : 'Expand all';
 }
 
 function toggleTool(id) { document.getElementById(id).classList.toggle('open'); }
