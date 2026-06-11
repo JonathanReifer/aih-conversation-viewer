@@ -654,6 +654,15 @@ mark.search-active { background: #f59e0b; color: #000; outline: 2px solid #f59e0
 ::-webkit-scrollbar { width: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* Event kind visibility toggles — applied via body.hide-* classes */
+body.hide-prompt .tl-prompt { display: none !important; }
+body.hide-api .tl-api,
+body.hide-api .otel-cost-bar { display: none !important; }
+body.hide-tool .tl-tool { display: none !important; }
+body.hide-hook .tl-hook { display: none !important; }
+body.hide-system .tl-system { display: none !important; }
+body.hide-error .tl-error { display: none !important; }
 </style>
 </head>
 <body>
@@ -842,10 +851,17 @@ async function loadSession(id) {
 }
 
 function toggleKind(kind, btn) {
-  if (hiddenKinds.has(kind)) { hiddenKinds.delete(kind); btn.classList.add('on'); }
-  else { hiddenKinds.add(kind); btn.classList.remove('on'); }
+  const cls = 'hide-' + kind;
+  if (hiddenKinds.has(kind)) {
+    hiddenKinds.delete(kind);
+    document.body.classList.remove(cls);
+    btn.classList.add('on');
+  } else {
+    hiddenKinds.add(kind);
+    document.body.classList.add(cls);
+    btn.classList.remove('on');
+  }
   localStorage.setItem('hiddenKinds', JSON.stringify([...hiddenKinds]));
-  if (activeId) loadSession(activeId);
 }
 
 function toggleAll() {
@@ -1331,8 +1347,11 @@ document.addEventListener('keydown', e => {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 
-document.querySelectorAll('#event-filters button[data-kind]').forEach(btn => {
-  if (hiddenKinds.has(btn.dataset.kind)) btn.classList.remove('on');
+// Apply saved hidden kinds on load — set body classes and update button state
+hiddenKinds.forEach(kind => {
+  document.body.classList.add('hide-' + kind);
+  const btn = document.querySelector('#event-filters button[data-kind="' + kind + '"]');
+  if (btn) btn.classList.remove('on');
 });
 
 initDateRange();
