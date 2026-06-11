@@ -882,7 +882,6 @@ function copyId(id) {
 // ── OTEL rendering ─────────────────────────────────────────────────────────
 
 function renderOtelEvent(ev) {
-  if (hiddenKinds.has(ev.kind)) return '';
   if (ev.kind === 'prompt') {
     return '<div class="tl-prompt"><div class="bubble">'+esc(ev.text)+'</div><div class="evt-meta">'+fmtTime(ev.ts)+'</div></div>';
   }
@@ -900,7 +899,6 @@ function renderOtelEvent(ev) {
     return renderToolCard(ev.toolName, ev.input, ev.resultSizeBytes, ev.success, ev.decision, ev.ts, ev.durationMs, ev.executed);
   }
   if (ev.kind === 'hook') {
-    if (hiddenKinds.has('hook')) return '';
     const dur = ev.durationMs > 0 ? (ev.durationMs).toFixed(0)+'ms' : '';
     return '<div class="tl-hook">'+
       '<span>⚙</span>'+
@@ -910,7 +908,6 @@ function renderOtelEvent(ev) {
       '</div>';
   }
   if (ev.kind === 'system') {
-    if (hiddenKinds.has('system')) return '';
     let label = '';
     const d = ev.detail || {};
     if (ev.subkind==='compaction') {
