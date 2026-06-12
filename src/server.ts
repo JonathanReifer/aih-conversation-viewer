@@ -185,6 +185,8 @@ async function queryLoki(query: string, startNs: bigint, endNs: bigint, limit = 
 // Paginated fetch — makes multiple 5000-entry Loki queries (sliding backward) until all events are
 // collected. Loki's server-side max is 5000/query; without pagination, sessions > ~2k events lose
 // their earliest data because newer sessions consume the quota.
+// Each sub-window is capped at 29 days to stay under Loki's 30d1h max_query_length limit —
+// a 30-day UI date range (start-of-day to end-of-day) actually spans ~31 days and triggers a 400.
 async function fetchOtelEvents(userFilter?: string, startTs?: string, endTs?: string): Promise<LokiEntry[]> {
   const nowNs = BigInt(Date.now()) * 1_000_000n;
   const startNs = startTs
@@ -192,20 +194,41 @@ async function fetchOtelEvents(userFilter?: string, startTs?: string, endTs?: st
     : nowNs - BigInt(LOOKBACK_DAYS) * 86_400_000_000_000n;
 
   const PAGE = 5000;
-  const MAX_PAGES = 20; // hard cap: 100k events
+  const MAX_PAGES = 40; // increased for sub-window pagination
+  const LOKI_WINDOW_NS = 29n * 86_400_000_000_000n; // 29-day sub-windows (Loki limit: 30d1h)
   const all: LokiEntry[] = [];
   let curEnd = endTs ? BigInt(new Date(endTs + 'T23:59:59Z').getTime()) * 1_000_000n : nowNs;
 
   for (let page = 0; page < MAX_PAGES; page++) {
-    const batch = await queryLoki(`{job="claude-code"}`, startNs, curEnd, PAGE);
-    if (!batch.length) break;
-    all.push(...batch);
-    if (batch.length < PAGE) break; // got all events in window
+    // Cap each Loki call to a 29-day window; slide backward between sub-windows
+    const effectiveStart = curEnd - LOKI_WINDOW_NS > startNs ? curEnd - LOKI_WINDOW_NS : startNs;
 
-    // Oldest entry in this page (direction=backward → last in array)
-    const oldestNs = BigInt(batch[batch.length - 1].tsNs);
+    const batch = await queryLoki(`{job="claude-code"}`, effectiveStart, curEnd, PAGE);
+
+    if (!batch.length) {
+      if (effectiveStart <= startNs) break; // exhausted the requested range
+      curEnd = effectiveStart - 1n; // slide to the previous sub-window
+      continue;
+    }
+
+    all.push(...batch);
+
+    if (batch.length < PAGE) {
+      // Got all events in this sub-window; move to the previous sub-window if any remain
+      if (effectiveStart <= startNs) break;
+      curEnd = effectiveStart - 1n;
+      continue;
+    }
+
+    // Full page — slide curEnd to just before the oldest event in this page
+    // Use min tsNs across all entries (multiple streams may not be globally sorted)
+    let oldestNs = BigInt(batch[0].tsNs);
+    for (const e of batch) {
+      const ns = BigInt(e.tsNs);
+      if (ns < oldestNs) oldestNs = ns;
+    }
     if (oldestNs <= startNs) break;
-    curEnd = oldestNs - 1n; // set next end to just before oldest
+    curEnd = oldestNs - 1n;
   }
 
   return userFilter ? all.filter((e) => e.attributes["user.email"] === userFilter) : all;
