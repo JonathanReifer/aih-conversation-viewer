@@ -52,12 +52,21 @@ type OtelTimelineEvent =
 
 // ── Proxy / JSONL types ────────────────────────────────────────────────────
 
+type ProxyLogFinding = {
+  scannerId: string;
+  description: string;
+  severity: "block" | "warn" | "info";
+  atlasTechnique?: string;
+};
+
 type ProxyLogEntry = {
   ts: string;
   sessionId: string;
   matchCount: number;
   tokenized: string[];
   model?: string;
+  decision?: "allow" | "ask" | "block";
+  findings?: ProxyLogFinding[];
 };
 
 type ContentBlock = { type: string; [key: string]: unknown };
@@ -93,6 +102,8 @@ type ProxySession = {
   piiCount: number;
   firstPrompt: string;
   messages: ProxyMessage[];
+  findings?: ProxyLogFinding[];
+  securityDecision?: "allow" | "ask" | "block";
 };
 
 function extractFirstPrompt(messages: ProxyMessage[]): string {
@@ -136,6 +147,12 @@ function segmentProxySessions(startTs?: string, endTs?: string): ProxySession[] 
       role: roles[i % 2],
       content: parseContent(t),
     }));
+    const allFindings = group.flatMap(e => e.findings ?? []);
+    const worstDecision = group.reduce((worst: "allow" | "ask" | "block", e) => {
+      if (e.decision === "block" || worst === "block") return "block";
+      if (e.decision === "ask" || worst === "ask") return "ask";
+      return worst;
+    }, "allow");
     return {
       id: sorted[0].ts,
       firstTs: sorted[0].ts,
@@ -145,6 +162,7 @@ function segmentProxySessions(startTs?: string, endTs?: string): ProxySession[] 
       piiCount: group.reduce((n, e) => n + e.matchCount, 0),
       firstPrompt: extractFirstPrompt(messages),
       messages,
+      ...(allFindings.length > 0 ? { findings: allFindings, securityDecision: worstDecision } : {}),
     };
   }).sort((a, b) => b.lastTs.localeCompare(a.lastTs));
 }
@@ -500,7 +518,7 @@ async function handleSession(id: string, source: Source, startTs?: string, endTs
     const sessions = segmentProxySessions(startTs, endTs);
     const s = sessions.find((p) => p.id === id);
     if (!s) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "content-type": "application/json" } });
-    return new Response(JSON.stringify({ id, source: "proxy", model: s.model, piiCount: s.piiCount, messages: s.messages }), { headers: { "content-type": "application/json" } });
+    return new Response(JSON.stringify({ id, source: "proxy", model: s.model, piiCount: s.piiCount, messages: s.messages, findings: s.findings ?? [], securityDecision: s.securityDecision ?? "allow" }), { headers: { "content-type": "application/json" } });
   }
 
   // unified — try proxy first (has full content), enrich with OTEL
@@ -612,6 +630,8 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, Bl
 .badge-error { background: var(--error-bg); color: var(--error-color); }
 .badge-user { background: var(--surface3); color: var(--accent3); }
 .badge-pii { background: var(--error-bg); color: var(--error-color); }
+.badge-sec-block { background: #7c1d1d; color: #fca5a5; }
+.badge-sec-warn { background: #78350f; color: #fcd34d; }
 .badge-linked { background: var(--surface3); color: var(--success-color); }
 
 /* Theme toggle */
@@ -702,6 +722,11 @@ mark.search-active { background: #f59e0b; color: #000; outline: 2px solid #f59e0
 
 .tl-error { background: var(--error-bg); border: 1px solid var(--error-color); border-radius: 8px; padding: 7px 12px; font-size: 12px; color: var(--error-color); font-family: monospace; }
 .tl-error .err-ts { font-size: 10px; color: var(--text3); margin-bottom: 2px; }
+
+/* Security findings panel */
+.sec-findings-panel { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; }
+.sec-findings-title { font-size: 11px; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+.sec-finding { font-size: 12px; padding: 4px 0; display: flex; gap: 8px; align-items: baseline; }
 
 /* Proxy conversation bubbles */
 .msg { display: flex; flex-direction: column; max-width: 78%; }
@@ -895,6 +920,13 @@ async function loadSession(id) {
   const evts = data.source==='otel' ? data.events : (data.otelEvents||[]);
   const toolCnt = evts.filter(e=>e.kind==='tool').length;
   const hookCnt = evts.filter(e=>e.kind==='hook').length;
+  const secFindings = data.findings ?? [];
+  const secDecision = data.securityDecision ?? 'allow';
+  const secBadge = secFindings.length > 0
+    ? (secDecision==='block'
+        ? '<span class="badge badge-sec-block">🛡 '+secFindings.length+' blocked</span>'
+        : '<span class="badge badge-sec-warn">⚠ '+secFindings.length+' finding'+(secFindings.length>1?'s':'')+'</span>')
+    : '';
   const hdrParts = [
     data.model&&data.model!=='unknown' ? '<span class="badge badge-model">'+esc(data.model)+'</span>' : '',
     data.source==='otel' ? (evts.filter(e=>e.kind==='prompt').length+' prompts') : (data.messages?.length??0)+' msgs',
@@ -902,6 +934,7 @@ async function loadSession(id) {
     hookCnt>0 ? '<span style="color:var(--text3);font-size:11px">⚙'+hookCnt+'</span>' : '',
     cost ? '<span class="badge badge-cost">'+esc(cost)+'</span>' : '',
     data.piiCount>0 ? '<span class="badge badge-pii">🔒'+data.piiCount+' PII</span>' : '',
+    secBadge,
     data.user ? '<span class="badge badge-user">'+esc(data.user.replace(/@.*/,''))+'</span>' : '',
   ].filter(Boolean);
   document.getElementById('thread-header').innerHTML =
@@ -929,10 +962,10 @@ async function loadSession(id) {
   if (data.source === 'otel') {
     thread.innerHTML = data.events.map(renderOtelEvent).join('');
   } else if (data.source === 'proxy') {
-    thread.innerHTML = data.messages.map(m=>renderProxyMessage(m,null)).join('');
+    thread.innerHTML = renderSecurityFindings(data.findings) + data.messages.map(m=>renderProxyMessage(m,null)).join('');
   } else {
     // unified: proxy messages as base, OTEL events interleaved
-    thread.innerHTML = renderUnified(data);
+    thread.innerHTML = renderSecurityFindings(data.findings) + renderUnified(data);
   }
   thread.scrollTop = thread.scrollHeight;
   setTimeout(() => { scanPii(); }, 50);
@@ -1168,6 +1201,19 @@ function extractToolPreview(name, input) {
 }
 
 function fmtBytes(n) { return n>1024?(n/1024).toFixed(1)+'kb':n+'b'; }
+
+// ── Security findings rendering ────────────────────────────────────────────
+
+function renderSecurityFindings(findings) {
+  if (!findings || findings.length === 0) return '';
+  const rows = findings.map(f => {
+    const sev = f.severity === 'block' ? 'badge-sec-block' : 'badge-sec-warn';
+    const atlas = f.atlasTechnique ? ' <span style="opacity:0.6;font-size:10px">'+esc(f.atlasTechnique)+'</span>' : '';
+    return '<div class="sec-finding"><span class="badge '+sev+'">'+esc(f.severity)+'</span> '+
+      esc(f.description)+atlas+'</div>';
+  }).join('');
+  return '<div class="sec-findings-panel"><div class="sec-findings-title">🛡 Security Findings</div>'+rows+'</div>';
+}
 
 // ── Proxy rendering ────────────────────────────────────────────────────────
 
