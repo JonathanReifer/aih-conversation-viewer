@@ -913,6 +913,16 @@ async function loadSession(id) {
 
   document.getElementById('event-filters').classList.toggle('active', data.source==='otel'||data.source==='unified');
 
+  // Reset all kind filters when loading a new session so nothing is accidentally hidden
+  if (hiddenKinds.size > 0) {
+    hiddenKinds.clear();
+    ['prompt','api','tool','hook','system','error'].forEach(k => {
+      document.body.classList.remove('hide-'+k);
+      const btn = document.querySelector('#event-filters [data-kind="'+k+'"]');
+      if (btn) btn.classList.add('on');
+    });
+  }
+
   allExpanded = false;
   const thread = document.getElementById('thread');
 
