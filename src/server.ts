@@ -298,14 +298,26 @@ function buildOtelTimeline(events: LokiEntry[]): OtelTimelineEvent[] {
     }
   }
 
-  // Index hook_execution_complete by (hookName + "_" + seq) for duration lookup
-  const hookCompleteByKey = new Map<string, LokiEntry>();
+  // Index hook_execution_complete events per hookName, sorted by sequence, for reliable pairing.
+  // Using seq-1 was fragile when other events interleave between start and complete.
+  const completeSeqsPerHook = new Map<string, number[]>(); // hookName → sorted seqs
+  const completeBySeq = new Map<number, LokiEntry>();       // seq → complete event
   for (const e of sorted) {
     if (e.body === "claude_code.hook_execution_complete") {
       const seq = Number(e.attributes["event.sequence"] ?? 0);
       const hookName = String(e.attributes["hook_name"] ?? "");
-      hookCompleteByKey.set(hookName + "_" + (seq - 1), e);
+      completeBySeq.set(seq, e);
+      const arr = completeSeqsPerHook.get(hookName) ?? [];
+      arr.push(seq);
+      completeSeqsPerHook.set(hookName, arr);
     }
+  }
+  function findHookComplete(hookName: string, startSeq: number): LokiEntry | undefined {
+    const seqs = completeSeqsPerHook.get(hookName) ?? [];
+    // Binary-search for smallest seq > startSeq (nearest complete after this start)
+    let lo = 0, hi = seqs.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (seqs[mid] <= startSeq) lo = mid + 1; else hi = mid; }
+    return lo < seqs.length ? completeBySeq.get(seqs[lo]) : undefined;
   }
 
   const timeline: OtelTimelineEvent[] = [];
@@ -329,6 +341,7 @@ function buildOtelTimeline(events: LokiEntry[]): OtelTimelineEvent[] {
         toolName: String(e.attributes["tool_name"] ?? "tool"),
         toolUseId,
         decision: String(e.attributes["decision"] ?? "accept"),
+        decisionSource: String(e.attributes["source"] ?? ""),
         input: inputParsed,
         executed: !!result,
         resultSizeBytes: result ? Number(result.attributes["tool_result_size_bytes"] ?? 0) : 0,
@@ -339,7 +352,7 @@ function buildOtelTimeline(events: LokiEntry[]): OtelTimelineEvent[] {
     } else if (e.body === "claude_code.hook_execution_start") {
       const seq = Number(e.attributes["event.sequence"] ?? 0);
       const hookName = String(e.attributes["hook_name"] ?? "");
-      const complete = hookCompleteByKey.get(hookName + "_" + seq);
+      const complete = findHookComplete(hookName, seq);
       timeline.push({
         kind: "hook",
         ts: e.ts,
@@ -348,6 +361,9 @@ function buildOtelTimeline(events: LokiEntry[]): OtelTimelineEvent[] {
         hookSource: String(e.attributes["hook_source"] ?? ""),
         numHooks: Number(e.attributes["num_hooks"] ?? 1),
         durationMs: complete ? Number(complete.attributes["total_duration_ms"] ?? 0) : 0,
+        numSuccess: complete ? Number(complete.attributes["num_success"] ?? 0) : undefined,
+        numBlocking: complete ? Number(complete.attributes["num_blocking"] ?? 0) : undefined,
+        numErrors: complete ? Number(complete.attributes["num_non_blocking_error"] ?? 0) : undefined,
       });
     } else if (e.body === "claude_code.compaction") {
       timeline.push({ kind: "system", ts: e.ts, subkind: "compaction", detail: {
@@ -628,6 +644,7 @@ mark.search-active { background: #f59e0b; color: #000; outline: 2px solid #f59e0
 
 /* Hook/system cards */
 .tl-hook { background: var(--surface); border: 1px solid var(--border3); border-left: 3px solid #6366f155; border-radius: 6px; padding: 4px 10px; font-size: 11px; color: var(--text3); font-family: monospace; display: flex; gap: 8px; align-items: center; max-width: 480px; }
+.tl-hook.tl-hook-blocked { border-left-color: var(--error-color); background: var(--error-bg); }
 .tl-hook .hk-name { color: var(--accent3); font-weight: 500; }
 .tl-hook .hk-dur { color: var(--text3); margin-left: auto; }
 .tl-system { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
@@ -945,10 +962,16 @@ function renderOtelEvent(ev) {
   }
   if (ev.kind === 'hook') {
     const dur = ev.durationMs > 0 ? (ev.durationMs).toFixed(0)+'ms' : '';
-    return '<div class="tl-hook">'+
+    const blocking = ev.numBlocking > 0;
+    const errored  = ev.numErrors > 0;
+    const statusIcon = blocking ? ' 🚫' : (errored ? ' ⚠' : '');
+    const successBadge = (ev.numSuccess !== undefined && ev.numSuccess > 0 && !blocking)
+      ? '<span style="color:var(--success-color);font-size:10px">✓'+ev.numSuccess+'</span>' : '';
+    return '<div class="tl-hook'+(blocking?' tl-hook-blocked':'')+'">'+
       '<span>⚙</span>'+
-      '<span class="hk-name">'+esc(ev.hookName)+'</span>'+
+      '<span class="hk-name">'+esc(ev.hookName)+esc(statusIcon)+'</span>'+
       (ev.numHooks>1?'<span style="color:var(--text3)">×'+ev.numHooks+'</span>':'')+
+      successBadge+
       (dur?'<span class="hk-dur">'+esc(dur)+'</span>':'')+
       '</div>';
   }
@@ -1053,7 +1076,9 @@ function renderToolBody(toolName, input, resultText) {
 
   const n = (toolName||'').toLowerCase();
   if (n==='bash') {
-    if (i.command) sections.push(['Command', String(i.command)]);
+    // tool_result uses "command"; tool_parameters (blocked/not-executed) uses "bash_command"/"full_command"
+    const cmd = i.command || i.full_command || i.bash_command;
+    if (cmd) sections.push(['Command', String(cmd)]);
     if (i.description) sections.push(['Description', String(i.description)]);
   } else if (n==='read') {
     if (i.file_path) sections.push(['File', String(i.file_path)]);
@@ -1106,7 +1131,7 @@ function extractToolPreview(name, input) {
   if (!input || typeof input !== 'object') return String(input||'').slice(0,80);
   const i = input;
   const n = (name||'').toLowerCase();
-  if (n==='bash') return String(i.command||'').split('\\n')[0].slice(0,80);
+  if (n==='bash') return String(i.command||i.full_command||i.bash_command||'').split('\\n')[0].slice(0,80);
   if (n==='read') return String(i.file_path||'');
   if (n==='write'||n==='edit'||n==='multiedit') return String(i.file_path||'');
   if (n==='agent') return String(i.description||'');
@@ -1420,7 +1445,7 @@ Bun.serve({
       return handleSession(decodeURIComponent(url.pathname.slice(14)), source, startTs, endTs);
     }
     if (url.pathname === "/") {
-      return new Response(HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
+      return new Response(HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
     }
     return new Response("Not Found", { status: 404 });
   },
