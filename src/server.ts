@@ -22,6 +22,7 @@ type SessionSummary = {
   totalCost?: number;
   totalTokens?: number;
   promptCount?: number;
+  toolCount?: number;
   hasErrors?: boolean;
   // proxy
   messageCount?: number;
@@ -243,6 +244,7 @@ type OtelSession = {
   totalCost: number;
   totalTokens: number;
   promptCount: number;
+  toolCount: number;
   hasErrors: boolean;
   firstPrompt: string;
   events: LokiEntry[];
@@ -259,7 +261,7 @@ function buildOtelSessions(events: LokiEntry[]): OtelSession[] {
 
   return Array.from(map.entries()).map(([id, es]): OtelSession => {
     const sorted = [...es].sort((a, b) => a.ts.localeCompare(b.ts));
-    let model = "unknown", totalCost = 0, totalTokens = 0, promptCount = 0, hasErrors = false, firstPrompt = "";
+    let model = "unknown", totalCost = 0, totalTokens = 0, promptCount = 0, toolCount = 0, hasErrors = false, firstPrompt = "";
     for (const e of sorted) {
       if (e.body === "claude_code.api_request") {
         model = String(e.attributes["model"] ?? model);
@@ -270,6 +272,7 @@ function buildOtelSessions(events: LokiEntry[]): OtelSession[] {
         promptCount++;
         if (!firstPrompt) firstPrompt = String(e.attributes["prompt"] ?? "").slice(0, 120);
       }
+      if (e.body === "claude_code.tool_decision") toolCount++;
       if (e.body === "claude_code.internal_error") hasErrors = true;
     }
     return {
@@ -277,7 +280,7 @@ function buildOtelSessions(events: LokiEntry[]): OtelSession[] {
       user: String(sorted[0].attributes["user.email"] ?? "unknown"),
       firstTs: sorted[0].ts,
       lastTs: sorted[sorted.length - 1].ts,
-      model, totalCost, totalTokens, promptCount, hasErrors, firstPrompt,
+      model, totalCost, totalTokens, promptCount, toolCount, hasErrors, firstPrompt,
       events: es,
     };
   }).sort((a, b) => b.lastTs.localeCompare(a.lastTs));
@@ -429,6 +432,7 @@ function correlate(otelSessions: OtelSession[], proxySessions: ProxySession[]): 
       totalCost: matched?.totalCost,
       totalTokens: matched?.totalTokens,
       promptCount: matched?.promptCount,
+      toolCount: matched?.toolCount,
       hasErrors: matched?.hasErrors,
       messageCount: proxy.messageCount,
       piiCount: proxy.piiCount,
@@ -445,7 +449,7 @@ function correlate(otelSessions: OtelSession[], proxySessions: ProxySession[]): 
       unified.push({
         id: o.id, source: "unified", firstTs: o.firstTs, lastTs: o.lastTs,
         firstPrompt: o.firstPrompt, model: o.model, user: o.user,
-        totalCost: o.totalCost, totalTokens: o.totalTokens, promptCount: o.promptCount,
+        totalCost: o.totalCost, totalTokens: o.totalTokens, promptCount: o.promptCount, toolCount: o.toolCount,
         hasErrors: o.hasErrors, otelId: o.id, otelSession: o,
       });
     }
@@ -464,7 +468,7 @@ async function handleSessions(source: Source, userFilter?: string, startTs?: str
     const events = await fetchOtelEvents(userFilter, startTs, endTs);
     const otel = buildOtelSessions(events);
     availableUsers = [...new Set(events.map((e) => String(e.attributes["user.email"] ?? "")).filter(Boolean))].sort();
-    sessions = otel.map((o): SessionSummary => ({ id: o.id, source: "otel", firstTs: o.firstTs, lastTs: o.lastTs, firstPrompt: o.firstPrompt, model: o.model, user: o.user, totalCost: o.totalCost, totalTokens: o.totalTokens, promptCount: o.promptCount, hasErrors: o.hasErrors }));
+    sessions = otel.map((o): SessionSummary => ({ id: o.id, source: "otel", firstTs: o.firstTs, lastTs: o.lastTs, firstPrompt: o.firstPrompt, model: o.model, user: o.user, totalCost: o.totalCost, totalTokens: o.totalTokens, promptCount: o.promptCount, toolCount: o.toolCount, hasErrors: o.hasErrors }));
   } else if (source === "proxy") {
     const proxy = segmentProxySessions(startTs, endTs);
     sessions = proxy.map((p): SessionSummary => ({ id: p.id, source: "proxy", firstTs: p.firstTs, lastTs: p.lastTs, firstPrompt: p.firstPrompt, model: p.model, messageCount: p.messageCount, piiCount: p.piiCount }));
@@ -602,6 +606,7 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, Bl
 .badge { font-size: 10px; padding: 1px 5px; border-radius: 8px; white-space: nowrap; }
 .badge-model { background: var(--surface3); color: var(--accent); }
 .badge-prompts { background: var(--surface3); color: var(--success-color); }
+.badge-tools { background: var(--surface3); color: var(--accent3); }
 .badge-msgs { background: var(--surface3); color: var(--success-color); }
 .badge-cost { background: var(--surface3); color: var(--cost-color); }
 .badge-error { background: var(--error-bg); color: var(--error-color); }
@@ -834,6 +839,7 @@ function renderSessionList(sessions) {
     const badges = [
       s.model&&s.model!=='unknown' ? '<span class="badge badge-model">'+esc(s.model.replace('claude-',''))+'</span>' : '',
       s.promptCount>0 ? '<span class="badge badge-prompts">'+s.promptCount+' prompts</span>' : '',
+      s.toolCount>0 ? '<span class="badge badge-tools">🔧'+s.toolCount+'</span>' : '',
       s.messageCount>0 ? '<span class="badge badge-msgs">'+s.messageCount+' msgs</span>' : '',
       cost ? '<span class="badge badge-cost">'+esc(cost)+'</span>' : '',
       s.hasErrors ? '<span class="badge badge-error">errors</span>' : '',
@@ -876,14 +882,24 @@ async function loadSession(id) {
   document.querySelectorAll('.session-row').forEach(r => {
     r.classList.toggle('active', r.getAttribute('onclick')?.includes("'"+id+"'"));
   });
-  const r = await fetch('/api/sessions/'+encodeURIComponent(id)+'?source='+activeSource);
+  const qs = new URLSearchParams({source: activeSource});
+  const dateFrom = document.getElementById('date-from')?.value;
+  const dateTo = document.getElementById('date-to')?.value;
+  if (dateFrom) qs.set('start', dateFrom);
+  if (dateTo) qs.set('end', dateTo);
+  const r = await fetch('/api/sessions/'+encodeURIComponent(id)+'?'+qs.toString());
   if (!r.ok) return;
   const data = await r.json();
 
   const cost = fmtCost(data.totalCost);
+  const evts = data.source==='otel' ? data.events : (data.otelEvents||[]);
+  const toolCnt = evts.filter(e=>e.kind==='tool').length;
+  const hookCnt = evts.filter(e=>e.kind==='hook').length;
   const hdrParts = [
     data.model&&data.model!=='unknown' ? '<span class="badge badge-model">'+esc(data.model)+'</span>' : '',
-    data.source==='otel' ? (data.events.filter(e=>e.kind==='prompt').length+' prompts') : (data.messages?.length??0)+' msgs',
+    data.source==='otel' ? (evts.filter(e=>e.kind==='prompt').length+' prompts') : (data.messages?.length??0)+' msgs',
+    toolCnt>0 ? '<span class="badge badge-tools">🔧'+toolCnt+' tools</span>' : '',
+    hookCnt>0 ? '<span style="color:var(--text3);font-size:11px">⚙'+hookCnt+'</span>' : '',
     cost ? '<span class="badge badge-cost">'+esc(cost)+'</span>' : '',
     data.piiCount>0 ? '<span class="badge badge-pii">🔒'+data.piiCount+' PII</span>' : '',
     data.user ? '<span class="badge badge-user">'+esc(data.user.replace(/@.*/,''))+'</span>' : '',

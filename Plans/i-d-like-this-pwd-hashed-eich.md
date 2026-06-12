@@ -1,202 +1,163 @@
-# Plan: Tool Call Display — OTEL Fix, Call/Result Linking, Better Formatting
+# Plan: E2E Feature Verification — Conversation Viewer
 
 ## Context
 
-Three improvements to `src/server.ts` (all changes in the embedded `<script>` and `buildOtelTimeline` function):
+All 8 features have been implemented (and repeatedly patched). Multiple bugs were found
+post-implementation: JS regex escaping blanked the thread panel, toggle state was being
+persisted in localStorage across broken iterations causing OTEL to show nothing, CSS
+hide rules didn't cover `.msg.user`. Rather than trust the code, run a live browser
+pass through every feature using Interceptor and fix anything that fails.
 
-1. **OTEL view doesn't show tool calls** — `buildOtelTimeline()` processes both `claude_code.tool_decision` AND `claude_code.tool_result`, creating duplicate (often empty) cards. Only `tool_result` carries the useful fields (`tool_input`, `tool_result_size_bytes`, `success`, `decision_type`, `duration_ms`). Tool_decision should be skipped entirely.
-
-2. **Tool calls and results are unlinked** — In proxy/unified view, `tool_use` blocks and `tool_result` blocks render as independent cards. The proxy data links them via `tool_use.id` ↔ `tool_result.tool_use_id`. They should render as one paired card: call on top, result nested below.
-
-3. **Expanded tool body is raw JSON** — The `.tool-body` just dumps `JSON.stringify(input, null, 2)`. Should show tool-specific formatted sections (input fields labeled, result content readable).
+**Server:** `http://localhost:4446` — Bun/TypeScript, single file `src/server.ts`
+**Live data:** 15 unified sessions, 13 OTEL-only, 4 proxy-only
+**Good test session (has prompts + PII):** `2026-06-11T14:37:55.087Z` (unified, 20 prompts, 8 PII hits)
 
 ---
 
-## Fix 1 — OTEL `buildOtelTimeline()` (`src/server.ts` ~line 248)
+## Test Sequence (Interceptor)
 
-Every tool invocation must be visible — approved, blocked, automatic, or rejected. The `tool_decision` event fires for all of them. The `tool_result` event fires only when the tool actually executed (i.e., was accepted). 
+Execute each step in order, screenshot after each state change.
 
-**Strategy: `tool_decision` is the primary card; `tool_result` is merged in when available.**
-
-```typescript
-// Two-pass approach in buildOtelTimeline():
-
-// Pass 1: index all tool_result events by tool_use_id
-const resultByToolUseId = new Map<string, LokiEntry>();
-for (const e of sorted) {
-  if (e.body === "claude_code.tool_result") {
-    resultByToolUseId.set(String(e.attributes["tool_use_id"] ?? ""), e);
-  }
-}
-
-// Pass 2: emit one tool event per tool_decision, merging result data when available
-for (const e of sorted) {
-  if (e.body === "claude_code.tool_decision") {
-    const toolUseId = String(e.attributes["tool_use_id"] ?? "");
-    const result = resultByToolUseId.get(toolUseId);  // may be undefined (blocked/rejected)
-    let inputParsed: unknown = result
-      ? result.attributes["tool_input"]          // result has the parsed input
-      : e.attributes["tool_parameters"];         // decision has params as fallback
-    try { inputParsed = JSON.parse(String(inputParsed)); } catch { /* keep string */ }
-    timeline.push({
-      kind: "tool",
-      ts: e.ts,
-      toolName: String(e.attributes["tool_name"] ?? "tool"),
-      toolUseId,
-      decision: String(e.attributes["decision"] ?? "accept"),  // approve/block/reject
-      input: inputParsed,
-      // from result if it ran:
-      resultSizeBytes: result ? Number(result.attributes["tool_result_size_bytes"] ?? 0) : 0,
-      success: result ? String(result.attributes["success"]) === "true" : false,
-      durationMs: result ? Number(result.attributes["duration_ms"] ?? 0) : 0,
-      executed: !!result,
-    });
-  }
-  // tool_result is consumed via the map above — not emitted separately
-}
+### Setup
 ```
-
-This produces **one card per tool invocation** showing:
-- Decision badge: `✅ auto` / `👤 approved` / `🚫 blocked` / `❌ rejected` (from `decision` field + source)
-- If executed: result size, duration — otherwise no result metadata
-- Visual difference: unexecuted tools get a greyed-out/strikethrough style
-
-Update `OtelTimelineEvent` tool kind to include `toolUseId`, `decision`, `durationMs`, `executed` fields.
-
----
-
-## Fix 2 — Paired tool call/result cards (proxy + unified view)
-
-**Where:** `renderContent()` in the embedded JS (~line 689).
-
-**Current behaviour:** Each `tool_use` and `tool_result` block in a message's content array is mapped independently to a card. Results appear orphaned below calls with no visual connection.
-
-**New approach:** Pre-process the content array before mapping to pair each `tool_result` with its `tool_use` by `tool_use_id`:
-
-```javascript
-function renderContent(content) {
-  if (typeof content === 'string') return esc(content);
-  if (!Array.isArray(content)) return esc(JSON.stringify(content));
-
-  // Build a lookup of tool_use blocks by id
-  const toolUseById = {};
-  for (const block of content) {
-    if (block?.type === 'tool_use' && block.id) toolUseById[block.id] = block;
-  }
-
-  // Track which tool_use ids have been consumed by a paired result
-  const consumed = new Set();
-
-  return content.map(block => {
-    if (!block || typeof block !== 'object') return '';
-    if (block.type === 'text') { ... }                    // unchanged
-    if (block.type === 'tool_use') {
-      if (consumed.has(block.id)) return '';              // already rendered as part of a pair
-      return renderToolCard(block.name||'tool', block.input, null, true, 'accept', null, null);
-    }
-    if (block.type === 'tool_result') {
-      const call = toolUseById[block.tool_use_id];
-      consumed.add(block.tool_use_id);
-      return renderPairedCard(call, block);              // new function
-    }
-    return '';
-  }).filter(Boolean).join('');
-}
+interceptor open "http://localhost:4446"
+interceptor screenshot
 ```
-
-**`renderPairedCard(callBlock, resultBlock)`** — renders a single combined card:
-- Header shows tool name + input preview (same as current)
-- Expanded body has two labeled sections: **Input** and **Result** (see Fix 3 for formatting)
-- Footer: `is_error` flag, result content length
-
-If a `tool_result` arrives with no matching `tool_use` (shouldn't happen but defensive): render result alone with `result` as the tool name.
+**Pass:** Sidebar shows session list. Thread shows "← Select a conversation to view". No JS errors in console.
 
 ---
 
-## Fix 3 — Tool-specific formatted body
-
-**Where:** Replace the current `renderToolCard` body section and introduce `renderToolBody(toolName, input, resultText)`.
-
-The `.tool-body` div currently dumps raw JSON. Replace with **labeled sections** using a small helper:
-
-```javascript
-function renderToolBody(toolName, input, resultText) {
-  const sections = [];
-  const i = input || {};
-
-  if (toolName === 'Bash' || toolName === 'bash') {
-    sections.push(['Command', i.command || '']);
-    if (i.description) sections.push(['Description', i.description]);
-  } else if (toolName === 'Read') {
-    sections.push(['File', i.file_path || '']);
-    if (i.offset) sections.push(['Offset', String(i.offset)]);
-    if (i.limit) sections.push(['Limit', String(i.limit)]);
-  } else if (toolName === 'Write') {
-    sections.push(['File', i.file_path || '']);
-    if (i.content) sections.push(['Content', i.content]);
-  } else if (toolName === 'Edit' || toolName === 'MultiEdit') {
-    sections.push(['File', i.file_path || '']);
-    if (i.old_string) sections.push(['Find', i.old_string]);
-    if (i.new_string) sections.push(['Replace', i.new_string]);
-  } else if (toolName === 'Agent') {
-    if (i.description) sections.push(['Description', i.description]);
-    if (i.prompt) sections.push(['Prompt', i.prompt]);
-  } else if (toolName === 'WebFetch') {
-    sections.push(['URL', i.url || '']);
-    if (i.prompt) sections.push(['Prompt', i.prompt]);
-  } else if (toolName === 'WebSearch') {
-    sections.push(['Query', i.query || '']);
-  } else if (toolName === 'Grep' || toolName === 'Glob') {
-    sections.push(['Pattern', i.pattern || i.query || '']);
-    if (i.path) sections.push(['Path', i.path]);
-  } else {
-    // Generic: render each top-level key as a labeled field
-    for (const [k, v] of Object.entries(i)) {
-      sections.push([k, typeof v === 'string' ? v : JSON.stringify(v, null, 2)]);
-    }
-  }
-
-  if (resultText) sections.push(['Result', resultText]);
-
-  return sections.map(([label, val]) =>
-    '<div class="tb-section">'+
-    '<div class="tb-label">'+esc(label)+'</div>'+
-    '<pre class="tb-value">'+esc(val)+'</pre>'+
-    '</div>'
-  ).join('');
-}
+### T1 — Session loads and shows content (Unified)
+Click the first session (`2026-06-11T14:37:55.087Z`).
 ```
-
-**New CSS** for the labeled sections (add to existing `<style>`):
-```css
-.tb-section { margin-bottom: 8px; }
-.tb-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
-            color: #4a5568; margin-bottom: 3px; }
-.tb-value { margin: 0; font-size: 11px; font-family: monospace; color: #94a3b8;
-            white-space: pre-wrap; word-break: break-all; background: #0f0f1a;
-            border: 1px solid #1e1e30; border-radius: 4px; padding: 6px 8px;
-            max-height: 200px; overflow-y: auto; }
+interceptor act <session-row-ref>
+interceptor screenshot
 ```
+**Pass:** Thread panel fills with message bubbles. Header shows model badge + "219 msgs".
+**Fail signals:** Thread is empty, or JS error in console (`interceptor eval "document.querySelectorAll('.msg').length"`).
 
-Update `renderToolCard` to call `renderToolBody(toolName, input, null)` for OTEL/unpaired, and `renderPairedCard` to call `renderToolBody(toolName, input, resultText)` with the result content.
+---
+
+### T2 — Theme toggle (F6)
+Click `☀` button (top-right of sidebar).
+```
+interceptor act <theme-btn-ref>
+interceptor screenshot
+```
+**Pass:** Background switches to light grey/white. Text readable. Button changes to `🌙`.
+Click again → back to dark.
 
 ---
 
-## Files Modified
-
-| File | Section | Change |
-|------|---------|--------|
-| `src/server.ts` | `buildOtelTimeline()` ~L248 | Drop `tool_decision` from branch condition; add `durationMs` extraction |
-| `src/server.ts` | `OtelTimelineEvent` type ~L53 | Add `durationMs` to tool kind |
-| `src/server.ts` | embedded `<style>` | Add `.tb-section`, `.tb-label`, `.tb-value` CSS |
-| `src/server.ts` | embedded `<script>` | Add `renderPairedCard()`, `renderToolBody()`; update `renderContent()` pairing logic; update `renderToolCard()` to call `renderToolBody` |
+### T3 — Event filter toggles (F2)
+With a session loaded, click "Tools" filter button.
+```
+interceptor act <tools-btn-ref>
+interceptor screenshot
+```
+**Pass:** All `.tl-tool` cards disappear instantly (no reload). "Tools" button loses highlight.
+Click "Prompts" → `.msg.user` bubbles disappear.
+Click both back on → both return.
+**Fail signals:** Nothing hides, or clicking causes full reload with empty thread.
 
 ---
+
+### T4 — OTEL source tab (F1 — hooks/system events)
+Click "⚡ OTEL" tab, then click a session with prompts (e.g. `5e821df5`).
+```
+interceptor act <otel-tab-ref>
+interceptor act <session-ref>
+interceptor screenshot
+```
+**Pass:** Thread shows a mix of: prompt bubbles (`.tl-prompt`), API cost bars (`.tl-api`), tool cards (`.tl-tool`), hook cards (`⚙ hookName`), system dividers (`◈ compaction`).
+**Check hook count:** `interceptor eval "document.querySelectorAll('.tl-hook').length"` — should be >0.
+**Fail signals:** Thread empty, or only prompt/api/tool events visible and no hook/system cards.
+
+---
+
+### T5 — Toggle hooks off in OTEL view
+Still on OTEL session, click "Hooks" filter button.
+**Pass:** All `⚙` hook cards hide. Click back on → they return.
+
+---
+
+### T6 — Time range selector (F8)
+Switch back to Unified. Set "From" date to today's date (`2026-06-11`) in the date-from input.
+```
+interceptor act <date-from-ref> "2026-06-11"
+```
+Wait for session list to reload.
+**Pass:** Session count drops (only today's sessions show). Set From back to 30-days-ago → full list returns.
+**Fail signals:** Session count unchanged, or "0 sessions" with a valid date.
+
+---
+
+### T7 — Sidebar search / global filter (F7)
+Type "plan" in the sidebar search input.
+**Pass:** Session list filters live to only sessions whose firstPrompt contains "plan". Clear → full list returns.
+
+---
+
+### T8 — In-conversation search (F7)
+Load a session. Click `🔍` button or press Ctrl+F.
+Type "the" (common word).
+**Pass:** Search bar appears. Matches highlighted in yellow (`mark.search-hit`). Count shows "1 of N". ↓/↑ navigate between hits.
+`interceptor eval "document.querySelectorAll('mark.search-hit').length"` → should be >0.
+
+---
+
+### T9 — PII navigation (F5)
+Load session `2026-06-11T01:20:29.574Z` (55 PII hits).
+**Pass:** `🔒` button visible in thread header. Click it → first PII mark scrolls into view and gets `.pii-active` highlight. Click again → advances to next hit.
+`interceptor eval "document.querySelectorAll('.pii-hit').length"` → should be ~55.
+**Fail signals:** No marks, or button click does nothing.
+
+---
+
+### T10 — Input source labels (F4)
+Load a proxy or unified session. Look at user messages.
+**Pass:** Some user messages show a small green `typed` badge (short messages) or blue `context` badge (long messages with headers).
+`interceptor eval "document.querySelectorAll('.msg-source').length"` → should be >0.
+
+---
+
+### T11 — Session fragmentation (F3)
+Compare proxy vs unified session counts.
+`curl http://localhost:4446/api/sessions?source=proxy` → expect 4 sessions (not 8+).
+If unified shows more sessions than OTEL for the same time window, check if proxy sessions are being over-split.
+
+---
+
+## Fix Strategy
+
+After each failing test, find the root cause before moving on:
+
+| Likely failure | Where to look |
+|----------------|---------------|
+| Thread empty after click | `loadSession()` L812 — check `!r.ok` silent return; check `renderOtelEvent`/`renderUnified` |
+| Toggles don't hide | CSS `body.hide-*` rules L658–666; `toggleKind()` L854 |
+| OTEL has no hook cards | `buildOtelTimeline()` — hook_execution_start branch; check actual Loki data has those events |
+| PII marks not appearing | `scanPii()` L1283 — check `setTimeout` fires; check PII_PATTERNS against actual text |
+| Search bar doesn't open | `toggleSearch()` L1206; check `#search-bar` CSS `display: none` vs `.open` |
+| Theme doesn't persist | `localStorage.getItem('theme')` at page load — present in init block? |
+
+---
+
+## Execution Order
+
+1. Run Interceptor test sequence T1–T11 in one session
+2. Screenshot evidence for each step
+3. Fix any failing features immediately (targeted edits to `src/server.ts`)
+4. Re-test fixed features
+5. Commit with summary of what passed/failed/fixed
+
+---
+
+## Files
+
+- `src/server.ts` — sole file; all fixes go here
+- `Plans/i-d-like-this-pwd-hashed-eich.md` — this file
 
 ## Verification
 
-1. `bun src/server.ts` starts cleanly, `node --check` on extracted JS passes
-2. OTEL view: click a session — tool cards appear (one per tool call, not doubled)
-3. Proxy/unified view: tool call + result render as one paired card; call input and result output are both visible in the expanded body
-4. Expanded body: labeled sections (`Command`, `File`, `Result`, etc.) instead of raw JSON blob
-5. Multiple back-to-back tool calls each have their result correctly paired (not cross-linked)
+All 11 test cases pass with screenshot evidence. `curl /api/sessions?source=proxy` returns ≤5 sessions.
