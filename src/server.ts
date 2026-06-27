@@ -124,22 +124,15 @@ function segmentProxySessions(startTs?: string, endTs?: string): ProxySession[] 
   if (startTs) entries = entries.filter(e => e.ts >= startTs);
   if (endTs) entries = entries.filter(e => e.ts <= endTs + 'Z');
 
-  const GAP_MS = 90 * 60 * 1000;
-  const groups: ProxyLogEntry[][] = [];
-  let current: ProxyLogEntry[] = [];
-
+  const sessionMap = new Map<string, ProxyLogEntry[]>();
   for (const e of entries) {
-    const prevTs = current.length ? new Date(current[current.length - 1].ts).getTime() : 0;
-    if (current.length > 0 && (new Date(e.ts).getTime() - prevTs) > GAP_MS) {
-      groups.push(current);
-      current = [e];
-    } else {
-      current.push(e);
-    }
+    const sid = e.sessionId || e.ts; // fall back to ts for legacy entries without sessionId
+    const arr = sessionMap.get(sid) ?? [];
+    arr.push(e);
+    sessionMap.set(sid, arr);
   }
-  if (current.length > 0) groups.push(current);
 
-  return groups.map((group): ProxySession => {
+  return Array.from(sessionMap.entries()).map(([sid, group]): ProxySession => {
     const best = group.reduce((a, b) => a.tokenized.length >= b.tokenized.length ? a : b);
     const sorted = [...group].sort((a, b) => a.ts.localeCompare(b.ts));
     const roles: Array<"user" | "assistant"> = ["user", "assistant"];
@@ -154,7 +147,7 @@ function segmentProxySessions(startTs?: string, endTs?: string): ProxySession[] 
       return worst;
     }, "allow");
     return {
-      id: sorted[0].ts,
+      id: sid,
       firstTs: sorted[0].ts,
       lastTs: sorted[sorted.length - 1].ts,
       model: best.model ?? "unknown",
@@ -425,18 +418,27 @@ type UnifiedSession = SessionSummary & {
 };
 
 function correlate(otelSessions: OtelSession[], proxySessions: ProxySession[]): UnifiedSession[] {
-  const TOLERANCE_MS = 10 * 60 * 1000; // 10-minute overlap tolerance
+  const TOLERANCE_MS = 10 * 60 * 1000; // 10-minute overlap tolerance — fallback for legacy entries
   const used = new Set<string>();
+  const otelById = new Map(otelSessions.map((o) => [o.id, o]));
 
   const unified: UnifiedSession[] = proxySessions.map((proxy): UnifiedSession => {
-    const pStart = new Date(proxy.firstTs).getTime() - TOLERANCE_MS;
-    const pEnd = new Date(proxy.lastTs).getTime() + TOLERANCE_MS;
-    const matched = otelSessions.find((o) => {
-      if (used.has(o.id)) return false;
-      const oStart = new Date(o.firstTs).getTime();
-      const oEnd = new Date(o.lastTs).getTime();
-      return Math.max(pStart, oStart) <= Math.min(pEnd, oEnd);
-    });
+    // Exact sessionId match (proxy.id is the sessionId since segmentProxySessions uses it as key)
+    let matched = otelById.get(proxy.id);
+    if (matched && !used.has(matched.id)) {
+      // exact hit
+    } else {
+      // Fall back to time-overlap for legacy proxy entries that used timestamp as id
+      matched = undefined;
+      const pStart = new Date(proxy.firstTs).getTime() - TOLERANCE_MS;
+      const pEnd = new Date(proxy.lastTs).getTime() + TOLERANCE_MS;
+      matched = otelSessions.find((o) => {
+        if (used.has(o.id)) return false;
+        const oStart = new Date(o.firstTs).getTime();
+        const oEnd = new Date(o.lastTs).getTime();
+        return Math.max(pStart, oStart) <= Math.min(pEnd, oEnd);
+      });
+    }
     if (matched) used.add(matched.id);
 
     return {
