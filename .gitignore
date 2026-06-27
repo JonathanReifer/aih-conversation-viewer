@@ -3,3 +3,6 @@ node_modules/
 .env
 *.pid
 Plans/
+.beads/
+.claude/
+.runtime/
