@@ -1,9 +1,10 @@
-import { readFileSync } from "fs";
+import { readFileSync, existsSync } from "fs";
 
 const PORT = 4446;
 const LOKI_URL = process.env.LOKI_URL ?? "http://localhost:3100";
 const LOOKBACK_DAYS = parseInt(process.env.LOOKBACK_DAYS ?? "30");
 const LOG_PATH = process.env.LOG_PATH ?? `${process.env.HOME}/.llm-privacy/prompts.jsonl`;
+const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH ?? `${process.env.HOME}/.llm-privacy/audit.jsonl`;
 
 // ── Shared types ───────────────────────────────────────────────────────────
 
@@ -424,6 +425,34 @@ type UnifiedSession = SessionSummary & {
   proxySession?: ProxySession;
 };
 
+// ── Audit / security types ─────────────────────────────────────────────────
+
+type AuditEntry = {
+  ts: string;
+  sessionId: string;
+  hookEvent: string;
+  toolName?: string;
+  matches: Array<{ type: string; severity: "block" | "warn" | "info"; token: string }>;
+  decision: "block" | "ask" | "allow";
+};
+
+type AuditEntryEnriched = AuditEntry & {
+  atlasTechniques: Array<{ id: string; name: string }>;
+};
+
+type SecurityStats = {
+  totalAuditEvents: number;
+  byDecision: Record<string, number>;
+  byMatchType: Record<string, number>;
+  byHookEvent: Record<string, number>;
+  byAtlasTechnique: Record<string, number>;
+  byMonth: Record<string, number>;
+  uniqueSessionsWithEvents: number;
+  topRiskySessions: Array<{ sessionId: string; blockCount: number; askCount: number; matchTypes: string[] }>;
+  proxyFindingsBySeverity: Record<string, number>;
+  proxyFindingsByScanner: Record<string, number>;
+};
+
 function correlate(otelSessions: OtelSession[], proxySessions: ProxySession[]): UnifiedSession[] {
   const TOLERANCE_MS = 10 * 60 * 1000; // 10-minute overlap tolerance
   const used = new Set<string>();
@@ -476,7 +505,121 @@ function correlate(otelSessions: OtelSession[], proxySessions: ProxySession[]): 
   return unified.sort((a, b) => b.lastTs.localeCompare(a.lastTs));
 }
 
+// ── Audit data layer ───────────────────────────────────────────────────────
+
+const ATLAS_TECHNIQUE_MAP: Record<string, { id: string; name: string }> = {
+  api_key_anthropic: { id: "AML.T0025", name: "Exfiltration via Inference API" },
+  api_key_openai:    { id: "AML.T0025", name: "Exfiltration via Inference API" },
+  api_key_github:    { id: "AML.T0025", name: "Exfiltration via Inference API" },
+  api_key_aws_access:{ id: "AML.T0025", name: "Exfiltration via Inference API" },
+  api_key_generic:   { id: "AML.T0025", name: "Exfiltration via Inference API" },
+  pii_ssn_us:        { id: "AML.T0098", name: "Private Data Inference" },
+  pii_credit_card:   { id: "AML.T0098", name: "Private Data Inference" },
+  pii_email:         { id: "AML.T0098", name: "Private Data Inference" },
+  pii_phone_us:      { id: "AML.T0098", name: "Private Data Inference" },
+};
+
+function readAuditEntries(startTs?: string, endTs?: string): AuditEntry[] {
+  if (!existsSync(AUDIT_LOG_PATH)) return [];
+  const start = startTs ? new Date(startTs).getTime() : 0;
+  const end = endTs ? new Date(endTs + "T23:59:59Z").getTime() : Infinity;
+  const entries: AuditEntry[] = [];
+  const raw = readFileSync(AUDIT_LOG_PATH, "utf8");
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const e = JSON.parse(trimmed) as AuditEntry;
+      const t = new Date(e.ts).getTime();
+      if (t >= start && t <= end) entries.push(e);
+    } catch { /* skip malformed */ }
+  }
+  return entries.sort((a, b) => a.ts.localeCompare(b.ts));
+}
+
+function enrichAuditEntry(e: AuditEntry): AuditEntryEnriched {
+  const seen = new Set<string>();
+  const atlasTechniques: Array<{ id: string; name: string }> = [];
+  for (const m of e.matches) {
+    const tech = ATLAS_TECHNIQUE_MAP[m.type];
+    if (tech && !seen.has(tech.id)) { seen.add(tech.id); atlasTechniques.push(tech); }
+  }
+  if (e.hookEvent === "UserPromptSubmit" && e.decision === "block" && !seen.has("AML.T0054")) {
+    atlasTechniques.push({ id: "AML.T0054", name: "Influence Operations" });
+  }
+  return { ...e, atlasTechniques };
+}
+
+function aggregateSecurityStats(auditEntries: AuditEntryEnriched[], proxyEntries: ProxyLogEntry[]): SecurityStats {
+  const byDecision: Record<string, number> = {};
+  const byMatchType: Record<string, number> = {};
+  const byHookEvent: Record<string, number> = {};
+  const byAtlasTechnique: Record<string, number> = {};
+  const byMonth: Record<string, number> = {};
+  const sessionMap = new Map<string, { blockCount: number; askCount: number; matchTypes: Set<string> }>();
+
+  for (const e of auditEntries) {
+    byDecision[e.decision] = (byDecision[e.decision] ?? 0) + 1;
+    byHookEvent[e.hookEvent] = (byHookEvent[e.hookEvent] ?? 0) + 1;
+    const month = e.ts.slice(0, 7);
+    byMonth[month] = (byMonth[month] ?? 0) + 1;
+    for (const m of e.matches) byMatchType[m.type] = (byMatchType[m.type] ?? 0) + 1;
+    for (const t of e.atlasTechniques) byAtlasTechnique[t.id] = (byAtlasTechnique[t.id] ?? 0) + 1;
+    if (!sessionMap.has(e.sessionId)) sessionMap.set(e.sessionId, { blockCount: 0, askCount: 0, matchTypes: new Set() });
+    const ss = sessionMap.get(e.sessionId)!;
+    if (e.decision === "block") ss.blockCount++;
+    else if (e.decision === "ask") ss.askCount++;
+    for (const m of e.matches) ss.matchTypes.add(m.type);
+  }
+
+  const proxyFindingsBySeverity: Record<string, number> = {};
+  const proxyFindingsByScanner: Record<string, number> = {};
+  for (const pe of proxyEntries) {
+    for (const f of pe.findings ?? []) {
+      proxyFindingsBySeverity[f.severity] = (proxyFindingsBySeverity[f.severity] ?? 0) + 1;
+      proxyFindingsByScanner[f.scannerId] = (proxyFindingsByScanner[f.scannerId] ?? 0) + 1;
+    }
+  }
+
+  const topRiskySessions = [...sessionMap.entries()]
+    .sort((a, b) => (b[1].blockCount + b[1].askCount) - (a[1].blockCount + a[1].askCount))
+    .slice(0, 5)
+    .map(([sessionId, v]) => ({ sessionId, blockCount: v.blockCount, askCount: v.askCount, matchTypes: [...v.matchTypes] }));
+
+  return {
+    totalAuditEvents: auditEntries.length,
+    byDecision, byMatchType, byHookEvent, byAtlasTechnique, byMonth,
+    uniqueSessionsWithEvents: sessionMap.size,
+    topRiskySessions,
+    proxyFindingsBySeverity, proxyFindingsByScanner,
+  };
+}
+
+function getAuditEntriesForSession(allEntries: AuditEntryEnriched[], sessionId: string, firstTs: string, lastTs: string): AuditEntryEnriched[] {
+  const MARGIN_MS = 5 * 60 * 1000;
+  const start = new Date(firstTs).getTime() - MARGIN_MS;
+  const end = new Date(lastTs).getTime() + MARGIN_MS;
+  return allEntries.filter(e =>
+    e.sessionId === sessionId ||
+    (new Date(e.ts).getTime() >= start && new Date(e.ts).getTime() <= end)
+  );
+}
+
 // ── HTTP handlers ──────────────────────────────────────────────────────────
+
+async function handleSecurityStats(startTs?: string, endTs?: string): Promise<Response> {
+  const auditEntries = readAuditEntries(startTs, endTs).map(enrichAuditEntry);
+  const proxyEntries = readProxyEntries();
+  return new Response(JSON.stringify(aggregateSecurityStats(auditEntries, proxyEntries)), { headers: { "content-type": "application/json" } });
+}
+
+async function handleSecurityEvents(startTs?: string, endTs?: string, sessionId?: string, decision?: string, limit = 500): Promise<Response> {
+  let entries = readAuditEntries(startTs, endTs).map(enrichAuditEntry);
+  if (sessionId) entries = entries.filter(e => e.sessionId === sessionId);
+  if (decision) entries = entries.filter(e => e.decision === decision);
+  const total = entries.length;
+  return new Response(JSON.stringify({ events: entries.slice(0, limit), total }), { headers: { "content-type": "application/json" } });
+}
 
 async function handleSessions(source: Source, userFilter?: string, startTs?: string, endTs?: string): Promise<Response> {
   let sessions: SessionSummary[];
@@ -501,6 +644,8 @@ async function handleSessions(source: Source, userFilter?: string, startTs?: str
 }
 
 async function handleSession(id: string, source: Source, startTs?: string, endTs?: string): Promise<Response> {
+  const allAudit = readAuditEntries(startTs, endTs).map(enrichAuditEntry);
+
   if (source === "otel") {
     const events = await fetchOtelEvents(undefined, startTs, endTs);
     const sessionEvents = events.filter((e) => String(e.attributes["session.id"] ?? "") === id);
@@ -511,14 +656,18 @@ async function handleSession(id: string, source: Source, startTs?: string, endTs
       if (e.body === "claude_code.api_request") { model = String(e.attributes["model"] ?? model); totalCost += Number(e.attributes["cost_usd"] ?? 0); }
     }
     const user = String(sessionEvents[0].attributes["user.email"] ?? "unknown");
-    return new Response(JSON.stringify({ id, source: "otel", user, model, totalCost, events: timeline }), { headers: { "content-type": "application/json" } });
+    const firstTs2 = sessionEvents[0].ts;
+    const lastTs2 = sessionEvents[sessionEvents.length - 1].ts;
+    const auditEvents = getAuditEntriesForSession(allAudit, id, firstTs2, lastTs2);
+    return new Response(JSON.stringify({ id, source: "otel", user, model, totalCost, events: timeline, auditEvents }), { headers: { "content-type": "application/json" } });
   }
 
   if (source === "proxy") {
     const sessions = segmentProxySessions(startTs, endTs);
     const s = sessions.find((p) => p.id === id);
     if (!s) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "content-type": "application/json" } });
-    return new Response(JSON.stringify({ id, source: "proxy", model: s.model, piiCount: s.piiCount, messages: s.messages, findings: s.findings ?? [], securityDecision: s.securityDecision ?? "allow" }), { headers: { "content-type": "application/json" } });
+    const auditEvents = getAuditEntriesForSession(allAudit, id, s.firstTs, s.lastTs);
+    return new Response(JSON.stringify({ id, source: "proxy", model: s.model, piiCount: s.piiCount, messages: s.messages, findings: s.findings ?? [], securityDecision: s.securityDecision ?? "allow", auditEvents }), { headers: { "content-type": "application/json" } });
   }
 
   // unified — try proxy first (has full content), enrich with OTEL
@@ -530,14 +679,20 @@ async function handleSession(id: string, source: Source, startTs?: string, endTs
 
   const otelTimeline = us.otelSession ? buildOtelTimeline(us.otelSession.events) : [];
   const messages = us.proxySession?.messages ?? [];
+  // use otelId for exact session match when available, fall back to time window
+  const sessionIdForAudit = us.otelId ?? id;
+  const auditEvents = getAuditEntriesForSession(allAudit, sessionIdForAudit, us.firstTs, us.lastTs);
 
   return new Response(JSON.stringify({
     id, source: "unified",
     user: us.user, model: us.model, totalCost: us.totalCost, totalTokens: us.totalTokens,
     otelId: us.otelId, proxyId: us.proxyId,
     piiCount: us.piiCount ?? 0,
-    messages,       // full proxy content
-    otelEvents: otelTimeline, // OTEL overlay
+    messages,
+    otelEvents: otelTimeline,
+    findings: us.proxySession?.findings ?? [],
+    securityDecision: us.proxySession?.securityDecision ?? "allow",
+    auditEvents,
   }), { headers: { "content-type": "application/json" } });
 }
 
@@ -755,6 +910,49 @@ body.hide-tool .tl-tool { display: none !important; }
 body.hide-hook .tl-hook { display: none !important; }
 body.hide-system .tl-system { display: none !important; }
 body.hide-error .tl-error { display: none !important; }
+
+/* ── Security dashboard ─────────────────────────────────────── */
+.sec-stats-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); gap:10px; padding:16px 20px 8px; }
+.sec-stat-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:12px 14px; text-align:center; }
+.sec-stat-card .sv { font-size:26px; font-weight:700; color:var(--accent); line-height:1; }
+.sec-stat-card .sv.red { color:var(--error-color); }
+.sec-stat-card .sv.amber { color:var(--cost-color); }
+.sec-stat-card .sv.green { color:var(--success-color); }
+.sec-stat-card .sl { font-size:10px; color:var(--text3); margin-top:4px; text-transform:uppercase; letter-spacing:.05em; }
+.sec-subtabs { display:flex; gap:6px; padding:0 20px 12px; border-bottom:1px solid var(--border); }
+.sec-subtabs button { background:transparent; border:1px solid var(--border); color:var(--text2); font-size:11px; padding:4px 10px; border-radius:4px; cursor:pointer; }
+.sec-subtabs button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+.sec-body { padding:0 20px 20px; }
+.sec-table { width:100%; border-collapse:collapse; font-size:12px; margin-top:10px; }
+.sec-table th { text-align:left; padding:6px 8px; font-size:10px; text-transform:uppercase; letter-spacing:.06em; color:var(--text3); border-bottom:1px solid var(--border); }
+.sec-table td { padding:6px 8px; border-bottom:1px solid var(--border2); vertical-align:middle; }
+.sec-table tr:hover td { background:var(--surface); }
+.sec-table .target-cell { font-family:monospace; font-size:11px; color:var(--text2); max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sec-table .session-link { font-family:monospace; font-size:11px; color:var(--accent); cursor:pointer; text-decoration:underline; }
+.sec-atlas-row { display:flex; align-items:center; gap:10px; padding:6px 0; border-bottom:1px solid var(--border2); }
+.sec-atlas-bar { height:8px; background:var(--accent); border-radius:4px; min-width:4px; }
+.sec-atlas-count { font-size:11px; color:var(--text3); margin-left:auto; flex-shrink:0; }
+.sec-proxy-row { display:flex; align-items:center; gap:8px; padding:5px 0; border-bottom:1px solid var(--border2); font-size:12px; }
+.sec-proxy-scanner { font-family:monospace; color:var(--text2); flex:1; }
+.sec-proxy-count { color:var(--text3); font-size:11px; }
+.badge-atlas { background:#1a2a1a; color:#4ade80; border:1px solid #2a4a2a; font-size:10px; padding:1px 6px; border-radius:8px; text-decoration:none; font-family:monospace; display:inline-block; }
+.badge-atlas:hover { background:#1e3a1e; color:#86efac; }
+.dec-block { background:var(--error-bg,#2d0a0a); color:var(--error-color); font-size:10px; padding:1px 6px; border-radius:8px; display:inline-block; }
+.dec-ask { background:#3d2700; color:#fbbf24; font-size:10px; padding:1px 6px; border-radius:8px; display:inline-block; }
+.dec-allow { background:var(--surface3); color:var(--success-color); font-size:10px; padding:1px 6px; border-radius:8px; display:inline-block; }
+.mt-badge { font-size:10px; padding:1px 5px; border-radius:6px; background:var(--surface3); color:var(--text2); margin:1px; display:inline-block; }
+.mt-key { background:#1e2a3a; color:#93c5fd; }
+.mt-pii { background:#2a1e3a; color:#c4b5fd; }
+/* ── Per-session audit panel ─────────────────────────────────── */
+.audit-panel { background:var(--surface2); border:1px solid var(--border); border-radius:8px; padding:10px 14px; margin-bottom:12px; }
+.audit-panel-title { font-size:11px; font-weight:600; color:var(--text3); text-transform:uppercase; letter-spacing:.06em; margin-bottom:8px; cursor:pointer; user-select:none; }
+.audit-event-row { display:flex; gap:6px; align-items:baseline; padding:4px 0; border-bottom:1px solid var(--border2); font-size:12px; flex-wrap:wrap; }
+.audit-event-row:last-child { border-bottom:none; }
+.ae-time { font-size:10px; color:var(--text3); white-space:nowrap; flex-shrink:0; }
+.ae-hook { font-size:10px; color:var(--accent3,#a78bfa); background:var(--surface3); padding:1px 5px; border-radius:4px; flex-shrink:0; }
+.ae-tool { font-family:monospace; font-size:11px; color:var(--text2); flex-shrink:0; }
+.ae-matches { display:flex; gap:2px; flex-wrap:wrap; }
+.ae-atlas { display:flex; gap:3px; flex-wrap:wrap; }
 </style>
 </head>
 <body>
@@ -768,6 +966,7 @@ body.hide-error .tl-error { display: none !important; }
     <button onclick="setSource('unified')" id="tab-unified" class="active">⬡ Unified</button>
     <button onclick="setSource('otel')" id="tab-otel">⚡ OTEL</button>
     <button onclick="setSource('proxy')" id="tab-proxy">🔍 LLM Proxy</button>
+    <button onclick="setView('security')" id="tab-security">🛡 Security</button>
   </div>
   <div id="date-range">
     <label>From</label><input type="date" id="date-from" onchange="applyDateRange()">
@@ -801,8 +1000,10 @@ body.hide-error .tl-error { display: none !important; }
 let activeId = null;
 let activeSource = 'unified';
 let activeUser = null;
+let activeView = 'conversations';
 let allExpanded = false;
 let allSessions = [];
+let secEventsBySession = {};
 localStorage.removeItem('hiddenKinds'); // clear stale toggle state from pre-fix sessions
 const hiddenKinds = new Set();
 
@@ -813,14 +1014,40 @@ function fmtCost(n) { if(!n||n===0) return null; return n<0.01?'<$0.01':'$'+n.to
 function fmtTok(n) { return n>=1000?(n/1000).toFixed(1)+'k':String(n); }
 
 function setSource(src) {
+  activeView = 'conversations';
   activeSource = src;
   activeId = null;
-  ['unified','otel','proxy'].forEach(s => {
+  ['unified','otel','proxy','security'].forEach(s => {
     document.getElementById('tab-'+s).classList.toggle('active', s===src);
   });
+  document.getElementById('event-filters').style.display = '';
+  document.getElementById('search-bar').style.display = '';
+  document.getElementById('date-range').style.display = '';
+  document.getElementById('sidebar-search').style.display = '';
   document.getElementById('thread-header').innerHTML = '<span class="info">Select a conversation</span>';
   document.getElementById('thread').innerHTML = '<div class="empty">← Select a conversation to view</div>';
   loadSessions();
+}
+
+function setView(view) {
+  activeView = view;
+  ['unified','otel','proxy','security'].forEach(s => {
+    document.getElementById('tab-'+s).classList.toggle('active', s===view);
+  });
+  if (view === 'security') {
+    document.getElementById('event-filters').style.display = 'none';
+    document.getElementById('search-bar').style.display = 'none';
+    document.getElementById('date-range').style.display = 'none';
+    document.getElementById('sidebar-search').style.display = 'none';
+    document.getElementById('thread-header').innerHTML = '<span class="info">Security Dashboard</span>';
+    document.getElementById('thread').innerHTML = '<div class="empty">Loading security data…</div>';
+    loadSecurityDashboard();
+  }
+}
+
+function switchToSession(id) {
+  setSource('unified');
+  loadSession(id);
 }
 
 async function loadSessions() {
@@ -869,6 +1096,7 @@ function renderSessionList(sessions) {
       cost ? '<span class="badge badge-cost">'+esc(cost)+'</span>' : '',
       s.hasErrors ? '<span class="badge badge-error">errors</span>' : '',
       s.piiCount>0 ? '<span class="badge badge-pii">🔒'+s.piiCount+'</span>' : '',
+      (()=>{ const sec=secEventsBySession[s.id]||secEventsBySession[s.otelId]; return sec ? (sec.blockCount>0?'<span class="badge badge-sec-block">🛡'+sec.blockCount+'</span>':sec.askCount>0?'<span class="badge badge-sec-warn">⚠'+sec.askCount+'</span>':'') : ''; })(),
       s.otelId&&s.proxyId ? '<span class="badge badge-linked">linked</span>' : '',
       multiUser&&!activeUser&&s.user ? '<span class="badge badge-user">'+esc(s.user.replace(/@.*/,''))+'</span>' : '',
     ].filter(Boolean).join('');
@@ -959,13 +1187,16 @@ async function loadSession(id) {
   allExpanded = false;
   const thread = document.getElementById('thread');
 
+  const auditEvents = data.auditEvents ?? [];
+  const otelEvts = data.source === 'otel' ? data.events : (data.otelEvents || []);
+
   if (data.source === 'otel') {
-    thread.innerHTML = data.events.map(renderOtelEvent).join('');
+    thread.innerHTML = renderAuditEventsPanel(auditEvents) + renderRiskPackages(otelEvts) + data.events.map(renderOtelEvent).join('');
   } else if (data.source === 'proxy') {
-    thread.innerHTML = renderSecurityFindings(data.findings) + data.messages.map(m=>renderProxyMessage(m,null)).join('');
+    thread.innerHTML = renderSecurityFindings(data.findings) + renderAuditEventsPanel(auditEvents) + data.messages.map(m=>renderProxyMessage(m,null)).join('');
   } else {
     // unified: proxy messages as base, OTEL events interleaved
-    thread.innerHTML = renderSecurityFindings(data.findings) + renderUnified(data);
+    thread.innerHTML = renderSecurityFindings(data.findings) + renderAuditEventsPanel(auditEvents) + renderRiskPackages(otelEvts) + renderUnified(data);
   }
   thread.scrollTop = thread.scrollHeight;
   setTimeout(() => { scanPii(); }, 50);
@@ -1202,17 +1433,89 @@ function extractToolPreview(name, input) {
 
 function fmtBytes(n) { return n>1024?(n/1024).toFixed(1)+'kb':n+'b'; }
 
-// ── Security findings rendering ────────────────────────────────────────────
+// ── Security findings & audit rendering ───────────────────────────────────
+
+const ATLAS_NAMES_CLIENT = {
+  'AML.T0025': 'Exfiltration via Inference API',
+  'AML.T0054': 'Influence Operations',
+  'AML.T0098': 'Private Data Inference',
+  'AML.T0010': 'Supply Chain Compromise',
+  'AML.T0051.000': 'Direct Prompt Injection',
+  'AML.T0051.001': 'Indirect LLM Injection',
+};
+
+function renderAtlasBadge(technique) {
+  if (!technique) return '';
+  const name = ATLAS_NAMES_CLIENT[technique] || technique;
+  const baseId = technique.replace(/\\.\\d{3}$/, '');
+  const url = 'https://atlas.mitre.org/techniques/' + encodeURIComponent(baseId);
+  return '<a class="badge badge-atlas" href="'+esc(url)+'" target="_blank" rel="noopener" title="'+esc(name)+'">'+esc(technique)+'</a>';
+}
 
 function renderSecurityFindings(findings) {
   if (!findings || findings.length === 0) return '';
-  const rows = findings.map(f => {
+  const byScanner = {};
+  for (const f of findings) {
+    if (!byScanner[f.scannerId]) byScanner[f.scannerId] = { ...f, count: 0 };
+    byScanner[f.scannerId].count++;
+  }
+  const rows = Object.values(byScanner).map(f => {
     const sev = f.severity === 'block' ? 'badge-sec-block' : 'badge-sec-warn';
-    const atlas = f.atlasTechnique ? ' <span style="opacity:0.6;font-size:10px">'+esc(f.atlasTechnique)+'</span>' : '';
+    const atlas = f.atlasTechnique ? ' '+renderAtlasBadge(f.atlasTechnique) : '';
+    const cnt = f.count > 1 ? ' <span style="color:var(--text3)">×'+f.count+'</span>' : '';
     return '<div class="sec-finding"><span class="badge '+sev+'">'+esc(f.severity)+'</span> '+
-      esc(f.description)+atlas+'</div>';
+      '<span style="font-family:monospace;font-size:11px;color:var(--text3)">'+esc(f.scannerId)+'</span> '+
+      esc(f.description)+cnt+atlas+'</div>';
   }).join('');
   return '<div class="sec-findings-panel"><div class="sec-findings-title">🛡 Security Findings</div>'+rows+'</div>';
+}
+
+function renderMatchTypeBadge(type) {
+  const isKey = type.startsWith('api_key_');
+  const cls = isKey ? 'mt-badge mt-key' : 'mt-badge mt-pii';
+  const label = isKey ? '🔑 '+type.replace('api_key_','') : '📋 '+type.replace('pii_','');
+  return '<span class="'+cls+'">'+esc(label)+'</span>';
+}
+
+function renderAuditEventsPanel(auditEvents) {
+  if (!auditEvents || !auditEvents.length) return '';
+  const rows = auditEvents.map(ev => {
+    const decCls = ev.decision === 'block' ? 'dec-block' : ev.decision === 'ask' ? 'dec-ask' : 'dec-allow';
+    const matchBadges = (ev.matches||[]).map(m => renderMatchTypeBadge(m.type)).join('');
+    const atlasBadges = (ev.atlasTechniques||[]).map(t => renderAtlasBadge(t.id)).join(' ');
+    return '<div class="audit-event-row">'+
+      '<span class="ae-time">'+esc(fmtTime(ev.ts))+'</span>'+
+      '<span class="'+decCls+'">'+esc(ev.decision)+'</span>'+
+      '<span class="ae-hook">'+esc(ev.hookEvent)+'</span>'+
+      (ev.toolName ? '<span class="ae-tool">'+esc(ev.toolName)+'</span>' : '')+
+      '<span class="ae-matches">'+matchBadges+'</span>'+
+      '<span class="ae-atlas">'+atlasBadges+'</span>'+
+      '</div>';
+  }).join('');
+  return '<div class="audit-panel">'+
+    '<div class="audit-panel-title" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display===\'none\'?\'block\':\'none\'">'+
+    '🔐 Security Audit ('+auditEvents.length+')</div>'+
+    '<div>'+rows+'</div></div>';
+}
+
+function renderRiskPackages(otelEvents) {
+  if (!otelEvents || !otelEvents.length) return '';
+  const pkgs = new Set();
+  for (const ev of otelEvents) {
+    if (ev.kind !== 'tool' || ev.toolName !== 'Bash') continue;
+    const cmd = (ev.input && typeof ev.input === 'object') ? String(ev.input.command || ev.input.full_command || '') : '';
+    if (!cmd) continue;
+    for (const m of cmd.matchAll(/npm\\s+(?:install|i)\\s+([^\\s;&|]+)/g)) pkgs.add(m[1]);
+    for (const m of cmd.matchAll(/pip3?\\s+install\\s+([^\\s;&|]+)/g)) pkgs.add(m[1]);
+    if (/curl\\s+[^|]+\\|\\s*(?:ba)?sh/.test(cmd)) pkgs.add('curl|sh');
+    if (/wget\\s+[^|]+\\|\\s*(?:ba)?sh/.test(cmd)) pkgs.add('wget|sh');
+    if (/eval\\s*\\$\\(curl/.test(cmd)) pkgs.add('eval$(curl)');
+  }
+  if (!pkgs.size) return '';
+  const rows = [...pkgs].map(p =>
+    '<div class="sec-finding"><span class="badge badge-sec-warn">'+esc(p)+'</span> '+renderAtlasBadge('AML.T0010')+'</div>'
+  ).join('');
+  return '<div class="sec-findings-panel"><div class="sec-findings-title">📦 Package Installs</div>'+rows+'</div>';
 }
 
 // ── Proxy rendering ────────────────────────────────────────────────────────
@@ -1480,6 +1783,129 @@ if (localStorage.getItem('theme') === 'light') {
   document.getElementById('theme-btn').textContent = '🌙';
 }
 
+// ── Security dashboard ─────────────────────────────────────────────────────
+
+let _secDashTab = 'events';
+let _secStats = null;
+let _secEvents = [];
+
+async function loadSecurityDashboard() {
+  const qs = new URLSearchParams();
+  const dateFrom = document.getElementById('date-from')?.value;
+  const dateTo = document.getElementById('date-to')?.value;
+  if (dateFrom) qs.set('start', dateFrom);
+  if (dateTo) qs.set('end', dateTo);
+  const [statsRes, eventsRes] = await Promise.all([
+    fetch('/api/security/stats?' + qs),
+    fetch('/api/security/events?limit=500&' + qs),
+  ]);
+  _secStats = await statsRes.json();
+  const evData = await eventsRes.json();
+  _secEvents = evData.events || [];
+  secEventsBySession = {};
+  for (const ev of _secEvents) {
+    if (!secEventsBySession[ev.sessionId]) secEventsBySession[ev.sessionId] = { blockCount:0, askCount:0 };
+    if (ev.decision === 'block') secEventsBySession[ev.sessionId].blockCount++;
+    else if (ev.decision === 'ask') secEventsBySession[ev.sessionId].askCount++;
+  }
+  renderSecurityDashboard(_secStats, _secEvents);
+}
+
+function renderSecurityDashboard(stats, events) {
+  const blocked = stats.byDecision?.block ?? 0;
+  const asked = stats.byDecision?.ask ?? 0;
+  const allowed = stats.byDecision?.allow ?? 0;
+  const totalProxy = Object.values(stats.proxyFindingsBySeverity||{}).reduce((a,b)=>a+b,0);
+  const topAtlas = Object.entries(stats.byAtlasTechnique||{}).sort((a,b)=>b[1]-a[1])[0];
+
+  const cards = [
+    ['sv', stats.totalAuditEvents ?? 0, 'Audit Events'],
+    ['sv red', blocked, 'Blocked'],
+    ['sv amber', asked, 'Flagged'],
+    ['sv green', allowed, 'Allowed'],
+    ['sv', stats.uniqueSessionsWithEvents ?? 0, 'Sessions'],
+    ['sv', totalProxy, 'Proxy Findings'],
+    topAtlas ? ['sv', topAtlas[1], 'Top: '+topAtlas[0]] : null,
+  ].filter(Boolean).map(([cls, val, label]) =>
+    '<div class="sec-stat-card"><div class="'+cls+'">'+val+'</div><div class="sl">'+esc(label)+'</div></div>'
+  ).join('');
+
+  const subtabs = ['events','atlas','proxy'].map(t =>
+    '<button class="'+(t===_secDashTab?'active':'')+'" onclick="secSubTab(\\\''+t+'\\\')">'+(t==='events'?'All Events':t==='atlas'?'By ATLAS':'Proxy Findings')+'</button>'
+  ).join('');
+
+  document.getElementById('thread').innerHTML =
+    '<div class="sec-stats-grid">'+cards+'</div>'+
+    '<div class="sec-subtabs">'+subtabs+'</div>'+
+    '<div class="sec-body" id="sec-body">'+renderSecSubTab(_secDashTab, stats, events)+'</div>';
+}
+
+function secSubTab(tab) {
+  _secDashTab = tab;
+  const bodyEl = document.getElementById('sec-body');
+  if (!bodyEl) return;
+  document.querySelectorAll('.sec-subtabs button').forEach(b =>
+    b.classList.toggle('active', b.textContent === (tab==='events'?'All Events':tab==='atlas'?'By ATLAS':'Proxy Findings'))
+  );
+  bodyEl.innerHTML = renderSecSubTab(tab, _secStats, _secEvents);
+}
+
+function renderSecSubTab(tab, stats, events) {
+  if (tab === 'atlas') return renderAtlasBreakdown(stats);
+  if (tab === 'proxy') return renderProxyBreakdown(stats);
+  return renderEventsTable(events);
+}
+
+function renderEventsTable(events) {
+  if (!events || !events.length) return '<div style="color:var(--text3);padding:20px">No security events in this date range.</div>';
+  const rows = events.map(ev => {
+    const decCls = ev.decision === 'block' ? 'dec-block' : ev.decision === 'ask' ? 'dec-ask' : 'dec-allow';
+    const matchBadges = (ev.matches||[]).map(m => renderMatchTypeBadge(m.type)).join('');
+    const atlasBadges = (ev.atlasTechniques||[]).map(t => renderAtlasBadge(t.id)).join(' ');
+    const sid = ev.sessionId ? ev.sessionId.slice(0,8) : '—';
+    return '<tr>'+
+      '<td style="white-space:nowrap;color:var(--text3);font-size:11px">'+esc(fmtTime(ev.ts))+'</td>'+
+      '<td><span class="session-link" onclick="switchToSession(\\\''+esc(ev.sessionId)+'\\\')">'+esc(sid)+'…</span></td>'+
+      '<td style="font-size:11px;color:var(--text3)">'+esc(ev.hookEvent||'')+'</td>'+
+      '<td style="font-family:monospace;font-size:11px">'+esc(ev.toolName||'—')+'</td>'+
+      '<td><span class="'+decCls+'">'+esc(ev.decision)+'</span></td>'+
+      '<td>'+matchBadges+'</td>'+
+      '<td>'+atlasBadges+'</td>'+
+      '</tr>';
+  }).join('');
+  return '<table class="sec-table"><thead><tr>'+
+    '<th>Time</th><th>Session</th><th>Hook</th><th>Tool</th><th>Decision</th><th>Match Types</th><th>ATLAS</th>'+
+    '</tr></thead><tbody>'+rows+'</tbody></table>';
+}
+
+function renderAtlasBreakdown(stats) {
+  const entries = Object.entries(stats?.byAtlasTechnique||{}).sort((a,b)=>b[1]-a[1]);
+  if (!entries.length) return '<div style="color:var(--text3);padding:20px">No ATLAS technique mappings found.</div>';
+  const max = entries[0][1];
+  return '<div style="padding-top:10px">'+entries.map(([tid, count]) => {
+    const name = ATLAS_NAMES_CLIENT[tid] || tid;
+    const pct = Math.round((count/max)*100);
+    return '<div class="sec-atlas-row">'+
+      renderAtlasBadge(tid)+
+      '<span style="font-size:12px;color:var(--text2)">'+esc(name)+'</span>'+
+      '<div class="sec-atlas-bar" style="width:'+pct+'px"></div>'+
+      '<span class="sec-atlas-count">'+count+'</span>'+
+      '</div>';
+  }).join('')+'</div>';
+}
+
+function renderProxyBreakdown(stats) {
+  const entries = Object.entries(stats?.proxyFindingsByScanner||{}).sort((a,b)=>b[1]-a[1]);
+  if (!entries.length) return '<div style="color:var(--text3);padding:20px">No proxy security findings in this date range.</div>';
+  return '<div style="padding-top:10px">'+entries.map(([scanner, count]) => {
+    const sev = (stats.proxyFindingsBySeverity || {});
+    return '<div class="sec-proxy-row">'+
+      '<span class="sec-proxy-scanner">'+esc(scanner)+'</span>'+
+      '<span class="sec-proxy-count">×'+count+'</span>'+
+      '</div>';
+  }).join('')+'</div>';
+}
+
 // ── Keyboard shortcuts ─────────────────────────────────────────────────────
 
 document.addEventListener('keydown', e => {
@@ -1495,7 +1921,7 @@ document.addEventListener('keydown', e => {
 
 initDateRange();
 loadSessions();
-setInterval(loadSessions, 30000);
+setInterval(() => { if (activeView !== 'security') loadSessions(); }, 30000);
 </script>
 </body>
 </html>`;
@@ -1515,6 +1941,13 @@ Bun.serve({
     }
     if (url.pathname.startsWith("/api/sessions/")) {
       return handleSession(decodeURIComponent(url.pathname.slice(14)), source, startTs, endTs);
+    }
+    if (url.pathname === "/api/security/stats") {
+      return handleSecurityStats(startTs, endTs);
+    }
+    if (url.pathname === "/api/security/events") {
+      const limit = parseInt(url.searchParams.get("limit") ?? "500");
+      return handleSecurityEvents(startTs, endTs, url.searchParams.get("session_id") ?? undefined, url.searchParams.get("decision") ?? undefined, limit);
     }
     if (url.pathname === "/") {
       return new Response(HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
