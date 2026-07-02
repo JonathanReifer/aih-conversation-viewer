@@ -17,7 +17,14 @@ type TailCacheState<T> = {
  * I/O failure it returns the last-known-good entries (or [] on a true cold
  * start with no prior state).
  */
-export function createJsonlTailCache<T>(parseLine: (line: string) => T | null) {
+// Linux caps a single positional read() at 0x7FFFF000 (~2.147GB) bytes; a
+// naive single readSync of a multi-GB delta silently returns fewer bytes
+// than requested. Chunking well under that cap keeps every read exact
+// regardless of how large the pending delta (or the whole file, on a cold
+// start) is.
+const DEFAULT_CHUNK_SIZE = 64 * 1024 * 1024;
+
+export function createJsonlTailCache<T>(parseLine: (line: string) => T | null, chunkSize = DEFAULT_CHUNK_SIZE) {
   const state: TailCacheState<T> = { entries: [], byteOffset: 0, partial: "", ino: -1 };
 
   function reset() {
@@ -58,14 +65,19 @@ export function createJsonlTailCache<T>(parseLine: (line: string) => T | null) {
       return state.entries.slice();
     }
 
-    const len = stat.size - state.byteOffset;
     let fd: number | undefined;
     try {
       fd = openSync(path, "r");
-      const buf = Buffer.alloc(len);
-      readSync(fd, buf, 0, len, state.byteOffset);
-      ingest(buf.toString("utf8"));
-      state.byteOffset = stat.size;
+      let pos = state.byteOffset;
+      while (pos < stat.size) {
+        const len = Math.min(chunkSize, stat.size - pos);
+        const buf = Buffer.alloc(len);
+        const bytesRead = readSync(fd, buf, 0, len, pos);
+        if (bytesRead <= 0) break;
+        ingest(buf.toString("utf8", 0, bytesRead));
+        pos += bytesRead;
+      }
+      state.byteOffset = pos;
     } catch {
       return state.entries.slice();
     } finally {

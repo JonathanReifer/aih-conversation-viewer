@@ -136,6 +136,20 @@ describe("createJsonlTailCache", () => {
     expect(second).toHaveLength(1);
   });
 
+  test("ISC-20: large delta spanning multiple internal read chunks is read completely and exactly", () => {
+    // Force a tiny chunkSize so a normal-sized fixture exercises the same
+    // multi-chunk read loop that a real multi-GB file would hit against the
+    // OS's single-read cap — proves no bytes are silently dropped or
+    // duplicated at chunk boundaries, including mid-line boundaries.
+    const lines = Array.from({ length: 500 }, (_, i) => JSON.stringify({ id: i, name: `entry-${i}` }));
+    writeFileSync(file, lines.join("\n") + "\n");
+    const cache = createJsonlTailCache(parseEntry, 17); // 17 bytes: guarantees splits land mid-line
+    const entries = cache.read(file);
+    expect(entries).toHaveLength(500);
+    expect(entries.map((e) => e.id)).toEqual(Array.from({ length: 500 }, (_, i) => i));
+    expect(entries[499]).toEqual({ id: 499, name: "entry-499" });
+  });
+
   test("multiple lines appended between two reads all appear in order", () => {
     writeFileSync(file, JSON.stringify({ id: 1, name: "a" }) + "\n");
     const cache = createJsonlTailCache(parseEntry);
