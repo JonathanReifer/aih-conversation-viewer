@@ -1,10 +1,17 @@
 import { lookupProject } from "./project.js";
 import { createJsonlTailCache } from "./logCache.js";
+import {
+  LOOKBACK_DAYS,
+  pruneOlderThan,
+  readProxyEntries,
+  segmentProxySessions,
+  resolveProxySessionMessages,
+  type ProxyIndexEntry,
+  type ProxySessionIndex,
+} from "./proxyLog.js";
 
 const PORT = 4446;
 const LOKI_URL = process.env.LOKI_URL ?? "http://localhost:3100";
-const LOOKBACK_DAYS = parseInt(process.env.LOOKBACK_DAYS ?? "30");
-const LOG_PATH = process.env.LOG_PATH ?? `${process.env.HOME}/.llm-privacy/prompts.jsonl`;
 const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH ?? `${process.env.HOME}/.llm-privacy/audit.jsonl`;
 
 // ── Shared types ───────────────────────────────────────────────────────────
@@ -52,124 +59,6 @@ type OtelTimelineEvent =
   | { kind: "hook"; ts: string; hookEvent: string; hookName: string; hookSource: string; numHooks: number; durationMs: number }
   | { kind: "system"; ts: string; subkind: string; detail: Record<string, unknown> }
   | { kind: "error"; ts: string; code: string; message: string };
-
-// ── Proxy / JSONL types ────────────────────────────────────────────────────
-
-type ProxyLogFinding = {
-  scannerId: string;
-  description: string;
-  severity: "block" | "warn" | "info";
-  atlasTechnique?: string;
-  owaspCategory?: string;
-};
-
-type ProxyLogEntry = {
-  ts: string;
-  sessionId: string;
-  matchCount: number;
-  tokenized: string[];
-  model?: string;
-  decision?: "allow" | "ask" | "block";
-  findings?: ProxyLogFinding[];
-};
-
-type ContentBlock = { type: string; [key: string]: unknown };
-type MessageContent = string | ContentBlock[];
-
-type ProxyMessage = {
-  role: "user" | "assistant";
-  content: MessageContent;
-};
-
-// ── Proxy data layer ───────────────────────────────────────────────────────
-
-function parseContent(s: string): MessageContent {
-  try { return JSON.parse(s) as MessageContent; } catch { return s; }
-}
-
-const proxyLogCache = createJsonlTailCache<ProxyLogEntry>((line) => {
-  try { return JSON.parse(line) as ProxyLogEntry; } catch { return null; }
-});
-
-function readProxyEntries(): ProxyLogEntry[] {
-  return proxyLogCache.read(LOG_PATH);
-}
-
-type ProxySession = {
-  id: string;
-  firstTs: string;
-  lastTs: string;
-  model: string;
-  messageCount: number;
-  piiCount: number;
-  firstPrompt: string;
-  messages: ProxyMessage[];
-  findings?: ProxyLogFinding[];
-  securityDecision?: "allow" | "ask" | "block";
-  project?: string;
-};
-
-function extractFirstPrompt(messages: ProxyMessage[]): string {
-  for (const msg of messages) {
-    if (msg.role !== "user") continue;
-    const c = msg.content;
-    if (typeof c === "string") return c.replace(/<[^>]+>/g, " ").trim().slice(0, 120);
-    if (Array.isArray(c)) {
-      const txt = (c as ContentBlock[]).find((b) => b.type === "text");
-      if (txt) return String(txt.text ?? "").replace(/<[^>]+>/g, " ").trim().slice(0, 120);
-    }
-  }
-  return "";
-}
-
-function segmentProxySessions(startTs?: string, endTs?: string): ProxySession[] {
-  let entries = readProxyEntries().sort((a, b) => a.ts.localeCompare(b.ts));
-  if (startTs) entries = entries.filter(e => e.ts >= startTs);
-  if (endTs) entries = entries.filter(e => e.ts <= endTs + 'Z');
-
-  const GAP_MS = 90 * 60 * 1000;
-  const groups: ProxyLogEntry[][] = [];
-  let current: ProxyLogEntry[] = [];
-
-  for (const e of entries) {
-    const prevTs = current.length ? new Date(current[current.length - 1].ts).getTime() : 0;
-    if (current.length > 0 && (new Date(e.ts).getTime() - prevTs) > GAP_MS) {
-      groups.push(current);
-      current = [e];
-    } else {
-      current.push(e);
-    }
-  }
-  if (current.length > 0) groups.push(current);
-
-  return groups.map((group): ProxySession => {
-    const best = group.reduce((a, b) => a.tokenized.length >= b.tokenized.length ? a : b);
-    const sorted = [...group].sort((a, b) => a.ts.localeCompare(b.ts));
-    const roles: Array<"user" | "assistant"> = ["user", "assistant"];
-    const messages: ProxyMessage[] = best.tokenized.map((t, i) => ({
-      role: roles[i % 2],
-      content: parseContent(t),
-    }));
-    const allFindings = group.flatMap(e => e.findings ?? []);
-    const worstDecision = group.reduce((worst: "allow" | "ask" | "block", e) => {
-      if (e.decision === "block" || worst === "block") return "block";
-      if (e.decision === "ask" || worst === "ask") return "ask";
-      return worst;
-    }, "allow");
-    return {
-      id: sorted[0].ts,
-      firstTs: sorted[0].ts,
-      lastTs: sorted[sorted.length - 1].ts,
-      model: best.model ?? "unknown",
-      messageCount: messages.length,
-      piiCount: group.reduce((n, e) => n + e.matchCount, 0),
-      firstPrompt: extractFirstPrompt(messages),
-      messages,
-      ...(allFindings.length > 0 ? { findings: allFindings, securityDecision: worstDecision } : {}),
-      project: lookupProject(sorted[0].sessionId),
-    };
-  }).sort((a, b) => b.lastTs.localeCompare(a.lastTs));
-}
 
 // ── OTEL / Loki data layer ─────────────────────────────────────────────────
 
@@ -427,7 +316,7 @@ function buildOtelTimeline(events: LokiEntry[]): OtelTimelineEvent[] {
 
 type UnifiedSession = SessionSummary & {
   otelSession?: OtelSession;
-  proxySession?: ProxySession;
+  proxySession?: ProxySessionIndex;
 };
 
 // ── Audit / security types ─────────────────────────────────────────────────
@@ -473,7 +362,7 @@ type SecurityStats = {
   };
 };
 
-function correlate(otelSessions: OtelSession[], proxySessions: ProxySession[]): UnifiedSession[] {
+function correlate(otelSessions: OtelSession[], proxySessions: ProxySessionIndex[]): UnifiedSession[] {
   const TOLERANCE_MS = 10 * 60 * 1000; // 10-minute overlap tolerance
   const used = new Set<string>();
 
@@ -562,9 +451,13 @@ const OWASP_CATEGORY_MAP: Record<string, { id: string; name: string }> = {
   injection_identity_override:    { id: "LLM01", name: "Prompt Injection" },
 };
 
-const auditLogCache = createJsonlTailCache<AuditEntry>((line) => {
-  try { return JSON.parse(line) as AuditEntry; } catch { return null; }
-});
+const auditLogCache = createJsonlTailCache<AuditEntry>(
+  (line) => {
+    try { return JSON.parse(line) as AuditEntry; } catch { return null; }
+  },
+  undefined,
+  pruneOlderThan
+);
 
 function readAuditEntries(startTs?: string, endTs?: string): AuditEntry[] {
   const start = startTs ? new Date(startTs).getTime() : 0;
@@ -609,7 +502,7 @@ function enrichAuditEntry(e: AuditEntry): AuditEntryEnriched {
   return { ...e, atlasTechniques, owaspCategories };
 }
 
-function aggregateSecurityStats(auditEntries: AuditEntryEnriched[], proxyEntries: ProxyLogEntry[]): SecurityStats {
+function aggregateSecurityStats(auditEntries: AuditEntryEnriched[], proxyEntries: ProxyIndexEntry[]): SecurityStats {
   const byDecision: Record<string, number> = {};
   const byMatchType: Record<string, number> = {};
   const byHookEvent: Record<string, number> = {};
@@ -756,8 +649,10 @@ async function handleSession(id: string, source: Source, startTs?: string, endTs
     const sessions = segmentProxySessions(startTs, endTs);
     const s = sessions.find((p) => p.id === id);
     if (!s) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "content-type": "application/json" } });
+    const messages = resolveProxySessionMessages(s.bestRef);
+    if (!messages) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "content-type": "application/json" } });
     const auditEvents = getAuditEntriesForSession(allAudit, id, s.firstTs, s.lastTs);
-    return new Response(JSON.stringify({ id, source: "proxy", model: s.model, project: s.project, piiCount: s.piiCount, messages: s.messages, findings: s.findings ?? [], securityDecision: s.securityDecision ?? "allow", auditEvents }), { headers: { "content-type": "application/json" } });
+    return new Response(JSON.stringify({ id, source: "proxy", model: s.model, project: s.project, piiCount: s.piiCount, messages, findings: s.findings ?? [], securityDecision: s.securityDecision ?? "allow", auditEvents }), { headers: { "content-type": "application/json" } });
   }
 
   // unified — try proxy first (has full content), enrich with OTEL
@@ -768,7 +663,7 @@ async function handleSession(id: string, source: Source, startTs?: string, endTs
   if (!us) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "content-type": "application/json" } });
 
   const otelTimeline = us.otelSession ? buildOtelTimeline(us.otelSession.events) : [];
-  const messages = us.proxySession?.messages ?? [];
+  const messages = us.proxySession ? (resolveProxySessionMessages(us.proxySession.bestRef) ?? []) : [];
   // use otelId for exact session match when available, fall back to time window
   const sessionIdForAudit = us.otelId ?? id;
   const auditEvents = getAuditEntriesForSession(allAudit, sessionIdForAudit, us.firstTs, us.lastTs);
