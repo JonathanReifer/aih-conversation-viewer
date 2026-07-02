@@ -1,5 +1,5 @@
 {
   "name": "pai-conv-viewer",
   "version": "1.0.0",
-  "scripts": { "start": "bun src/server.ts" }
+  "scripts": { "start": "bun src/server.ts", "test": "bun test" }
 }

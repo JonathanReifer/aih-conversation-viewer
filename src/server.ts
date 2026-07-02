@@ -1,5 +1,5 @@
-import { readFileSync, existsSync } from "fs";
 import { lookupProject } from "./project.js";
+import { createJsonlTailCache } from "./logCache.js";
 
 const PORT = 4446;
 const LOKI_URL = process.env.LOKI_URL ?? "http://localhost:3100";
@@ -87,14 +87,12 @@ function parseContent(s: string): MessageContent {
   try { return JSON.parse(s) as MessageContent; } catch { return s; }
 }
 
+const proxyLogCache = createJsonlTailCache<ProxyLogEntry>((line) => {
+  try { return JSON.parse(line) as ProxyLogEntry; } catch { return null; }
+});
+
 function readProxyEntries(): ProxyLogEntry[] {
-  try {
-    return readFileSync(LOG_PATH, "utf8")
-      .split("\n")
-      .filter((l) => l.trim())
-      .map((l) => { try { return JSON.parse(l) as ProxyLogEntry; } catch { return null; } })
-      .filter(Boolean) as ProxyLogEntry[];
-  } catch { return []; }
+  return proxyLogCache.read(LOG_PATH);
 }
 
 type ProxySession = {
@@ -564,21 +562,17 @@ const OWASP_CATEGORY_MAP: Record<string, { id: string; name: string }> = {
   injection_identity_override:    { id: "LLM01", name: "Prompt Injection" },
 };
 
+const auditLogCache = createJsonlTailCache<AuditEntry>((line) => {
+  try { return JSON.parse(line) as AuditEntry; } catch { return null; }
+});
+
 function readAuditEntries(startTs?: string, endTs?: string): AuditEntry[] {
-  if (!existsSync(AUDIT_LOG_PATH)) return [];
   const start = startTs ? new Date(startTs).getTime() : 0;
   const end = endTs ? new Date(endTs + "T23:59:59Z").getTime() : Infinity;
-  const entries: AuditEntry[] = [];
-  const raw = readFileSync(AUDIT_LOG_PATH, "utf8");
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const e = JSON.parse(trimmed) as AuditEntry;
-      const t = new Date(e.ts).getTime();
-      if (t >= start && t <= end) entries.push(e);
-    } catch { /* skip malformed */ }
-  }
+  const entries = auditLogCache.read(AUDIT_LOG_PATH).filter((e) => {
+    const t = new Date(e.ts).getTime();
+    return t >= start && t <= end;
+  });
   return entries.sort((a, b) => a.ts.localeCompare(b.ts));
 }
 
@@ -2122,6 +2116,14 @@ setInterval(() => { if (activeView !== 'security') loadSessions(); }, 30000);
 </html>`;
 
 // ── Router ─────────────────────────────────────────────────────────────────
+
+{
+  const warmStart = performance.now();
+  const proxyCount = readProxyEntries().length;
+  const auditCount = readAuditEntries().length;
+  const elapsedMs = Math.round(performance.now() - warmStart);
+  console.log(`[logCache] pre-warm: ${proxyCount} proxy entries, ${auditCount} audit entries in ${elapsedMs}ms`);
+}
 
 Bun.serve({
   port: PORT,
