@@ -1633,7 +1633,7 @@ function renderAuditEventsPanel(auditEvents) {
       '</div>';
   }).join('');
   return '<div class="audit-panel">'+
-    '<div class="audit-panel-title" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display===\'none\'?\'block\':\'none\'">'+
+    '<div class="audit-panel-title" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display===\\'none\\'?\\'block\\':\\'none\\'">'+
     '🔐 Security Audit ('+auditEvents.length+')</div>'+
     '<div>'+rows+'</div></div>';
 }
