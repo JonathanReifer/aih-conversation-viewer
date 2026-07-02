@@ -70,9 +70,23 @@ async function queryLoki(query: string, startNs: bigint, endNs: bigint, limit = 
   url.searchParams.set("limit", limit.toString());
   url.searchParams.set("direction", "backward");
 
-  const res = await fetch(url.toString(), { signal: AbortSignal.timeout(15000) });
+  // Loki is a real external dependency that can be slow, unready, or briefly
+  // unavailable (observed directly: /ready flapped 503 -> ready mid-session).
+  // A hung or slow fetch here must never take down the whole /api/sessions
+  // response — it degrades to "no OTEL events this page," never throws.
+  let res: Response;
+  try {
+    res = await fetch(url.toString(), { signal: AbortSignal.timeout(4000) });
+  } catch {
+    return [];
+  }
   if (!res.ok) return [];
-  const data = await res.json() as { status: string; data: { result: { stream: Record<string, string>; values: [string, string][] }[] } };
+  let data: { status: string; data: { result: { stream: Record<string, string>; values: [string, string][] }[] } };
+  try {
+    data = await res.json() as typeof data;
+  } catch {
+    return [];
+  }
   if (data.status !== "success") return [];
 
   const entries: LokiEntry[] = [];
@@ -111,7 +125,15 @@ async function fetchOtelEvents(userFilter?: string, startTs?: string, endTs?: st
   const all: LokiEntry[] = [];
   let curEnd = endTs ? BigInt(new Date(endTs + 'T23:59:59Z').getTime()) * 1_000_000n : nowNs;
 
+  // Wall-clock budget across the whole pagination loop, independent of page count:
+  // Loki being slow/unready must degrade to partial results, never make this request
+  // outlast Bun.serve's own idleTimeout (10s) — a hang here previously killed the
+  // entire /api/sessions response with no useful error.
+  const deadline = performance.now() + 6000;
+
   for (let page = 0; page < MAX_PAGES; page++) {
+    if (performance.now() > deadline) break;
+
     // Cap each Loki call to a 29-day window; slide backward between sub-windows
     const effectiveStart = curEnd - LOKI_WINDOW_NS > startNs ? curEnd - LOKI_WINDOW_NS : startNs;
 
