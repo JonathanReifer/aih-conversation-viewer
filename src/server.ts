@@ -1,4 +1,5 @@
 import { readFileSync, existsSync } from "fs";
+import { lookupProject } from "./project.js";
 
 const PORT = 4446;
 const LOKI_URL = process.env.LOKI_URL ?? "http://localhost:3100";
@@ -18,6 +19,7 @@ type SessionSummary = {
   lastTs: string;
   firstPrompt: string;
   model: string;
+  project?: string;
   // otel
   user?: string;
   totalCost?: number;
@@ -58,6 +60,7 @@ type ProxyLogFinding = {
   description: string;
   severity: "block" | "warn" | "info";
   atlasTechnique?: string;
+  owaspCategory?: string;
 };
 
 type ProxyLogEntry = {
@@ -105,6 +108,7 @@ type ProxySession = {
   messages: ProxyMessage[];
   findings?: ProxyLogFinding[];
   securityDecision?: "allow" | "ask" | "block";
+  project?: string;
 };
 
 function extractFirstPrompt(messages: ProxyMessage[]): string {
@@ -164,6 +168,7 @@ function segmentProxySessions(startTs?: string, endTs?: string): ProxySession[] 
       firstPrompt: extractFirstPrompt(messages),
       messages,
       ...(allFindings.length > 0 ? { findings: allFindings, securityDecision: worstDecision } : {}),
+      project: lookupProject(sorted[0].sessionId),
     };
   }).sort((a, b) => b.lastTs.localeCompare(a.lastTs));
 }
@@ -257,6 +262,7 @@ async function fetchOtelEvents(userFilter?: string, startTs?: string, endTs?: st
 type OtelSession = {
   id: string;
   user: string;
+  project?: string;
   firstTs: string;
   lastTs: string;
   model: string;
@@ -297,6 +303,7 @@ function buildOtelSessions(events: LokiEntry[]): OtelSession[] {
     return {
       id,
       user: String(sorted[0].attributes["user.email"] ?? "unknown"),
+      project: lookupProject(id),
       firstTs: sorted[0].ts,
       lastTs: sorted[sorted.length - 1].ts,
       model, totalCost, totalTokens, promptCount, toolCount, hasErrors, firstPrompt,
@@ -430,14 +437,22 @@ type UnifiedSession = SessionSummary & {
 type AuditEntry = {
   ts: string;
   sessionId: string;
+  project?: string;
   hookEvent: string;
   toolName?: string;
-  matches: Array<{ type: string; severity: "block" | "warn" | "info"; token: string }>;
+  matches: Array<{
+    type: string;
+    severity: "block" | "warn" | "info";
+    token: string;
+    atlasTechnique?: string;
+    owaspCategory?: string;
+  }>;
   decision: "block" | "ask" | "allow";
 };
 
 type AuditEntryEnriched = AuditEntry & {
   atlasTechniques: Array<{ id: string; name: string }>;
+  owaspCategories: Array<{ id: string; name: string }>;
 };
 
 type SecurityStats = {
@@ -446,11 +461,18 @@ type SecurityStats = {
   byMatchType: Record<string, number>;
   byHookEvent: Record<string, number>;
   byAtlasTechnique: Record<string, number>;
+  byOwaspCategory: Record<string, number>;
   byMonth: Record<string, number>;
   uniqueSessionsWithEvents: number;
   topRiskySessions: Array<{ sessionId: string; blockCount: number; askCount: number; matchTypes: string[] }>;
   proxyFindingsBySeverity: Record<string, number>;
   proxyFindingsByScanner: Record<string, number>;
+  secrets: {
+    blocked: number;
+    tokenizedInFlight: number;
+    piiNoise: number;
+    recentBlocked: Array<{ sessionId: string; ts: string; scannerId: string }>;
+  };
 };
 
 function correlate(otelSessions: OtelSession[], proxySessions: ProxySession[]): UnifiedSession[] {
@@ -475,6 +497,7 @@ function correlate(otelSessions: OtelSession[], proxySessions: ProxySession[]): 
       lastTs: matched ? (proxy.lastTs > matched.lastTs ? proxy.lastTs : matched.lastTs) : proxy.lastTs,
       firstPrompt: proxy.firstPrompt,
       model: matched?.model ?? proxy.model,
+      project: matched?.project ?? proxy.project,
       user: matched?.user,
       totalCost: matched?.totalCost,
       totalTokens: matched?.totalTokens,
@@ -495,7 +518,7 @@ function correlate(otelSessions: OtelSession[], proxySessions: ProxySession[]): 
     if (!used.has(o.id)) {
       unified.push({
         id: o.id, source: "unified", firstTs: o.firstTs, lastTs: o.lastTs,
-        firstPrompt: o.firstPrompt, model: o.model, user: o.user,
+        firstPrompt: o.firstPrompt, model: o.model, project: o.project, user: o.user,
         totalCost: o.totalCost, totalTokens: o.totalTokens, promptCount: o.promptCount, toolCount: o.toolCount,
         hasErrors: o.hasErrors, otelId: o.id, otelSession: o,
       });
@@ -510,6 +533,7 @@ function correlate(otelSessions: OtelSession[], proxySessions: ProxySession[]): 
 const ATLAS_TECHNIQUE_MAP: Record<string, { id: string; name: string }> = {
   api_key_anthropic: { id: "AML.T0025", name: "Exfiltration via Inference API" },
   api_key_openai:    { id: "AML.T0025", name: "Exfiltration via Inference API" },
+  api_key_xai:       { id: "AML.T0025", name: "Exfiltration via Inference API" },
   api_key_github:    { id: "AML.T0025", name: "Exfiltration via Inference API" },
   api_key_aws_access:{ id: "AML.T0025", name: "Exfiltration via Inference API" },
   api_key_generic:   { id: "AML.T0025", name: "Exfiltration via Inference API" },
@@ -517,6 +541,27 @@ const ATLAS_TECHNIQUE_MAP: Record<string, { id: string; name: string }> = {
   pii_credit_card:   { id: "AML.T0098", name: "Private Data Inference" },
   pii_email:         { id: "AML.T0098", name: "Private Data Inference" },
   pii_phone_us:      { id: "AML.T0098", name: "Private Data Inference" },
+  injection_instruction_override: { id: "AML.T0051", name: "LLM Prompt Injection" },
+  injection_system_tag:           { id: "AML.T0051", name: "LLM Prompt Injection" },
+  injection_dan:                  { id: "AML.T0051", name: "LLM Prompt Injection" },
+  injection_identity_override:    { id: "AML.T0051", name: "LLM Prompt Injection" },
+};
+
+const OWASP_CATEGORY_MAP: Record<string, { id: string; name: string }> = {
+  api_key_anthropic: { id: "LLM02", name: "Sensitive Information Disclosure" },
+  api_key_openai:    { id: "LLM02", name: "Sensitive Information Disclosure" },
+  api_key_xai:       { id: "LLM02", name: "Sensitive Information Disclosure" },
+  api_key_github:    { id: "LLM02", name: "Sensitive Information Disclosure" },
+  api_key_aws_access:{ id: "LLM02", name: "Sensitive Information Disclosure" },
+  api_key_generic:   { id: "LLM02", name: "Sensitive Information Disclosure" },
+  pii_ssn_us:        { id: "LLM02", name: "Sensitive Information Disclosure" },
+  pii_credit_card:   { id: "LLM02", name: "Sensitive Information Disclosure" },
+  pii_email:         { id: "LLM02", name: "Sensitive Information Disclosure" },
+  pii_phone_us:      { id: "LLM02", name: "Sensitive Information Disclosure" },
+  injection_instruction_override: { id: "LLM01", name: "Prompt Injection" },
+  injection_system_tag:           { id: "LLM01", name: "Prompt Injection" },
+  injection_dan:                  { id: "LLM01", name: "Prompt Injection" },
+  injection_identity_override:    { id: "LLM01", name: "Prompt Injection" },
 };
 
 function readAuditEntries(startTs?: string, endTs?: string): AuditEntry[] {
@@ -537,17 +582,37 @@ function readAuditEntries(startTs?: string, endTs?: string): AuditEntry[] {
   return entries.sort((a, b) => a.ts.localeCompare(b.ts));
 }
 
+const ATLAS_NAME_BY_ID: Record<string, string> = Object.fromEntries(
+  Object.values(ATLAS_TECHNIQUE_MAP).map((t) => [t.id, t.name])
+);
+const OWASP_NAME_BY_ID: Record<string, string> = Object.fromEntries(
+  Object.values(OWASP_CATEGORY_MAP).map((c) => [c.id, c.name])
+);
+
 function enrichAuditEntry(e: AuditEntry): AuditEntryEnriched {
-  const seen = new Set<string>();
+  const seenAtlas = new Set<string>();
   const atlasTechniques: Array<{ id: string; name: string }> = [];
+  const seenOwasp = new Set<string>();
+  const owaspCategories: Array<{ id: string; name: string }> = [];
   for (const m of e.matches) {
-    const tech = ATLAS_TECHNIQUE_MAP[m.type];
-    if (tech && !seen.has(tech.id)) { seen.add(tech.id); atlasTechniques.push(tech); }
+    // Prefer the taxonomy fields persisted on the match itself (new schema);
+    // fall back to the static per-type map for audit entries logged before
+    // the middleware started persisting these fields.
+    const atlasId = m.atlasTechnique ?? ATLAS_TECHNIQUE_MAP[m.type]?.id;
+    if (atlasId && !seenAtlas.has(atlasId)) {
+      seenAtlas.add(atlasId);
+      atlasTechniques.push({ id: atlasId, name: ATLAS_NAME_BY_ID[atlasId] ?? atlasId });
+    }
+    const owaspId = m.owaspCategory ?? OWASP_CATEGORY_MAP[m.type]?.id;
+    if (owaspId && !seenOwasp.has(owaspId)) {
+      seenOwasp.add(owaspId);
+      owaspCategories.push({ id: owaspId, name: OWASP_NAME_BY_ID[owaspId] ?? owaspId });
+    }
   }
-  if (e.hookEvent === "UserPromptSubmit" && e.decision === "block" && !seen.has("AML.T0054")) {
+  if (e.hookEvent === "UserPromptSubmit" && e.decision === "block" && !seenAtlas.has("AML.T0054")) {
     atlasTechniques.push({ id: "AML.T0054", name: "Influence Operations" });
   }
-  return { ...e, atlasTechniques };
+  return { ...e, atlasTechniques, owaspCategories };
 }
 
 function aggregateSecurityStats(auditEntries: AuditEntryEnriched[], proxyEntries: ProxyLogEntry[]): SecurityStats {
@@ -555,16 +620,35 @@ function aggregateSecurityStats(auditEntries: AuditEntryEnriched[], proxyEntries
   const byMatchType: Record<string, number> = {};
   const byHookEvent: Record<string, number> = {};
   const byAtlasTechnique: Record<string, number> = {};
+  const byOwaspCategory: Record<string, number> = {};
   const byMonth: Record<string, number> = {};
   const sessionMap = new Map<string, { blockCount: number; askCount: number; matchTypes: Set<string> }>();
+
+  // Secrets view: "blocked" = a secret pattern (api_key_*) that tripped a
+  // block decision — was about to leak, got caught. "piiNoise" = everything
+  // else (background PII detections regardless of decision). "tokenizedInFlight"
+  // (below, from proxy findings) is the proxy's core value prop — a secret
+  // that got swapped for a token and still went out, rather than blocked.
+  let secretsBlocked = 0;
+  let piiNoise = 0;
+  const recentBlocked: Array<{ sessionId: string; ts: string; scannerId: string }> = [];
 
   for (const e of auditEntries) {
     byDecision[e.decision] = (byDecision[e.decision] ?? 0) + 1;
     byHookEvent[e.hookEvent] = (byHookEvent[e.hookEvent] ?? 0) + 1;
     const month = e.ts.slice(0, 7);
     byMonth[month] = (byMonth[month] ?? 0) + 1;
-    for (const m of e.matches) byMatchType[m.type] = (byMatchType[m.type] ?? 0) + 1;
+    for (const m of e.matches) {
+      byMatchType[m.type] = (byMatchType[m.type] ?? 0) + 1;
+      if (m.type.startsWith("api_key_") && e.decision === "block") {
+        secretsBlocked++;
+        recentBlocked.push({ sessionId: e.sessionId, ts: e.ts, scannerId: m.type });
+      } else if (m.type.startsWith("pii_")) {
+        piiNoise++;
+      }
+    }
     for (const t of e.atlasTechniques) byAtlasTechnique[t.id] = (byAtlasTechnique[t.id] ?? 0) + 1;
+    for (const c of e.owaspCategories) byOwaspCategory[c.id] = (byOwaspCategory[c.id] ?? 0) + 1;
     if (!sessionMap.has(e.sessionId)) sessionMap.set(e.sessionId, { blockCount: 0, askCount: 0, matchTypes: new Set() });
     const ss = sessionMap.get(e.sessionId)!;
     if (e.decision === "block") ss.blockCount++;
@@ -574,10 +658,13 @@ function aggregateSecurityStats(auditEntries: AuditEntryEnriched[], proxyEntries
 
   const proxyFindingsBySeverity: Record<string, number> = {};
   const proxyFindingsByScanner: Record<string, number> = {};
+  let secretsTokenizedInFlight = 0;
   for (const pe of proxyEntries) {
     for (const f of pe.findings ?? []) {
       proxyFindingsBySeverity[f.severity] = (proxyFindingsBySeverity[f.severity] ?? 0) + 1;
       proxyFindingsByScanner[f.scannerId] = (proxyFindingsByScanner[f.scannerId] ?? 0) + 1;
+      if (f.scannerId.startsWith("privacy/api_key")) secretsTokenizedInFlight++;
+      else if (f.scannerId.startsWith("privacy/pii")) piiNoise++;
     }
   }
 
@@ -588,10 +675,16 @@ function aggregateSecurityStats(auditEntries: AuditEntryEnriched[], proxyEntries
 
   return {
     totalAuditEvents: auditEntries.length,
-    byDecision, byMatchType, byHookEvent, byAtlasTechnique, byMonth,
+    byDecision, byMatchType, byHookEvent, byAtlasTechnique, byOwaspCategory, byMonth,
     uniqueSessionsWithEvents: sessionMap.size,
     topRiskySessions,
     proxyFindingsBySeverity, proxyFindingsByScanner,
+    secrets: {
+      blocked: secretsBlocked,
+      tokenizedInFlight: secretsTokenizedInFlight,
+      piiNoise,
+      recentBlocked: recentBlocked.sort((a, b) => b.ts.localeCompare(a.ts)).slice(0, 20),
+    },
   };
 }
 
@@ -621,7 +714,7 @@ async function handleSecurityEvents(startTs?: string, endTs?: string, sessionId?
   return new Response(JSON.stringify({ events: entries.slice(0, limit), total }), { headers: { "content-type": "application/json" } });
 }
 
-async function handleSessions(source: Source, userFilter?: string, startTs?: string, endTs?: string): Promise<Response> {
+async function handleSessions(source: Source, userFilter?: string, startTs?: string, endTs?: string, projectFilter?: string): Promise<Response> {
   let sessions: SessionSummary[];
   let availableUsers: string[] = [];
 
@@ -629,10 +722,10 @@ async function handleSessions(source: Source, userFilter?: string, startTs?: str
     const events = await fetchOtelEvents(userFilter, startTs, endTs);
     const otel = buildOtelSessions(events);
     availableUsers = [...new Set(events.map((e) => String(e.attributes["user.email"] ?? "")).filter(Boolean))].sort();
-    sessions = otel.map((o): SessionSummary => ({ id: o.id, source: "otel", firstTs: o.firstTs, lastTs: o.lastTs, firstPrompt: o.firstPrompt, model: o.model, user: o.user, totalCost: o.totalCost, totalTokens: o.totalTokens, promptCount: o.promptCount, toolCount: o.toolCount, hasErrors: o.hasErrors }));
+    sessions = otel.map((o): SessionSummary => ({ id: o.id, source: "otel", firstTs: o.firstTs, lastTs: o.lastTs, firstPrompt: o.firstPrompt, model: o.model, project: o.project, user: o.user, totalCost: o.totalCost, totalTokens: o.totalTokens, promptCount: o.promptCount, toolCount: o.toolCount, hasErrors: o.hasErrors }));
   } else if (source === "proxy") {
     const proxy = segmentProxySessions(startTs, endTs);
-    sessions = proxy.map((p): SessionSummary => ({ id: p.id, source: "proxy", firstTs: p.firstTs, lastTs: p.lastTs, firstPrompt: p.firstPrompt, model: p.model, messageCount: p.messageCount, piiCount: p.piiCount }));
+    sessions = proxy.map((p): SessionSummary => ({ id: p.id, source: "proxy", firstTs: p.firstTs, lastTs: p.lastTs, firstPrompt: p.firstPrompt, model: p.model, project: p.project, messageCount: p.messageCount, piiCount: p.piiCount }));
   } else {
     const [events, proxy] = await Promise.all([fetchOtelEvents(userFilter, startTs, endTs), Promise.resolve(segmentProxySessions(startTs, endTs))]);
     const otel = buildOtelSessions(events);
@@ -640,7 +733,10 @@ async function handleSessions(source: Source, userFilter?: string, startTs?: str
     sessions = correlate(otel, proxy).map(({ otelSession: _o, proxySession: _p, ...summary }) => summary as SessionSummary);
   }
 
-  return new Response(JSON.stringify({ sessions, total: sessions.length, availableUsers }), { headers: { "content-type": "application/json" } });
+  const availableProjects = [...new Set(sessions.map((s) => s.project).filter(Boolean))].sort() as string[];
+  if (projectFilter) sessions = sessions.filter((s) => s.project === projectFilter);
+
+  return new Response(JSON.stringify({ sessions, total: sessions.length, availableUsers, availableProjects }), { headers: { "content-type": "application/json" } });
 }
 
 async function handleSession(id: string, source: Source, startTs?: string, endTs?: string): Promise<Response> {
@@ -659,7 +755,7 @@ async function handleSession(id: string, source: Source, startTs?: string, endTs
     const firstTs2 = sessionEvents[0].ts;
     const lastTs2 = sessionEvents[sessionEvents.length - 1].ts;
     const auditEvents = getAuditEntriesForSession(allAudit, id, firstTs2, lastTs2);
-    return new Response(JSON.stringify({ id, source: "otel", user, model, totalCost, events: timeline, auditEvents }), { headers: { "content-type": "application/json" } });
+    return new Response(JSON.stringify({ id, source: "otel", user, project: lookupProject(id), model, totalCost, events: timeline, auditEvents }), { headers: { "content-type": "application/json" } });
   }
 
   if (source === "proxy") {
@@ -667,7 +763,7 @@ async function handleSession(id: string, source: Source, startTs?: string, endTs
     const s = sessions.find((p) => p.id === id);
     if (!s) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "content-type": "application/json" } });
     const auditEvents = getAuditEntriesForSession(allAudit, id, s.firstTs, s.lastTs);
-    return new Response(JSON.stringify({ id, source: "proxy", model: s.model, piiCount: s.piiCount, messages: s.messages, findings: s.findings ?? [], securityDecision: s.securityDecision ?? "allow", auditEvents }), { headers: { "content-type": "application/json" } });
+    return new Response(JSON.stringify({ id, source: "proxy", model: s.model, project: s.project, piiCount: s.piiCount, messages: s.messages, findings: s.findings ?? [], securityDecision: s.securityDecision ?? "allow", auditEvents }), { headers: { "content-type": "application/json" } });
   }
 
   // unified — try proxy first (has full content), enrich with OTEL
@@ -685,7 +781,7 @@ async function handleSession(id: string, source: Source, startTs?: string, endTs
 
   return new Response(JSON.stringify({
     id, source: "unified",
-    user: us.user, model: us.model, totalCost: us.totalCost, totalTokens: us.totalTokens,
+    user: us.user, project: us.project, model: us.model, totalCost: us.totalCost, totalTokens: us.totalTokens,
     otelId: us.otelId, proxyId: us.proxyId,
     piiCount: us.piiCount ?? 0,
     messages,
@@ -767,6 +863,9 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, Bl
 #user-filter { display: flex; gap: 5px; flex-wrap: wrap; padding: 6px 10px; border-bottom: 1px solid var(--border3); background: var(--bg); }
 #user-filter button { font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text2); cursor: pointer; }
 #user-filter button.active { background: var(--surface3); color: var(--accent); border-color: var(--accent2); }
+#project-filter { display: flex; gap: 5px; flex-wrap: wrap; padding: 6px 10px; border-bottom: 1px solid var(--border3); background: var(--bg); }
+#project-filter button { font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text2); cursor: pointer; }
+#project-filter button.active { background: var(--surface3); color: var(--accent3); border-color: var(--accent3); }
 #session-list { flex: 1; overflow-y: auto; }
 
 .session-row { padding: 9px 13px; cursor: pointer; border-bottom: 1px solid var(--border2); transition: background 0.1s; }
@@ -784,6 +883,7 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, Bl
 .badge-cost { background: var(--surface3); color: var(--cost-color); }
 .badge-error { background: var(--error-bg); color: var(--error-color); }
 .badge-user { background: var(--surface3); color: var(--accent3); }
+.badge-project { background: var(--surface3); color: var(--accent2); }
 .badge-pii { background: var(--error-bg); color: var(--error-color); }
 .badge-sec-block { background: #7c1d1d; color: #fca5a5; }
 .badge-sec-warn { background: #78350f; color: #fcd34d; }
@@ -937,6 +1037,8 @@ body.hide-error .tl-error { display: none !important; }
 .sec-proxy-count { color:var(--text3); font-size:11px; }
 .badge-atlas { background:#1a2a1a; color:#4ade80; border:1px solid #2a4a2a; font-size:10px; padding:1px 6px; border-radius:8px; text-decoration:none; font-family:monospace; display:inline-block; }
 .badge-atlas:hover { background:#1e3a1e; color:#86efac; }
+.badge-owasp { background:#2a1a2e; color:#e879f9; border:1px solid #4a2a4e; font-size:10px; padding:1px 6px; border-radius:8px; text-decoration:none; font-family:monospace; display:inline-block; }
+.badge-owasp:hover { background:#3a1e3e; color:#f0abfc; }
 .dec-block { background:var(--error-bg,#2d0a0a); color:var(--error-color); font-size:10px; padding:1px 6px; border-radius:8px; display:inline-block; }
 .dec-ask { background:#3d2700; color:#fbbf24; font-size:10px; padding:1px 6px; border-radius:8px; display:inline-block; }
 .dec-allow { background:var(--surface3); color:var(--success-color); font-size:10px; padding:1px 6px; border-radius:8px; display:inline-block; }
@@ -974,6 +1076,7 @@ body.hide-error .tl-error { display: none !important; }
   </div>
   <div id="sidebar-search"><input id="sidebar-search-input" type="text" placeholder="Search conversations…" oninput="filterSessions(this.value)"></div>
   <div id="user-filter" style="display:none"></div>
+  <div id="project-filter" style="display:none"></div>
   <div id="session-list"></div>
 </div>
 <div id="main">
@@ -1000,6 +1103,7 @@ body.hide-error .tl-error { display: none !important; }
 let activeId = null;
 let activeSource = 'unified';
 let activeUser = null;
+let activeProject = null;
 let activeView = 'conversations';
 let allExpanded = false;
 let allSessions = [];
@@ -1053,6 +1157,7 @@ function switchToSession(id) {
 async function loadSessions() {
   const qs = new URLSearchParams({source: activeSource});
   if (activeUser) qs.set('user', activeUser);
+  if (activeProject) qs.set('project', activeProject);
   const dateFrom = document.getElementById('date-from')?.value;
   const dateTo = document.getElementById('date-to')?.value;
   if (dateFrom) qs.set('start', dateFrom);
@@ -1072,6 +1177,16 @@ async function loadSessions() {
       }).join('');
   } else { filterEl.style.display = 'none'; }
 
+  const projectFilterEl = document.getElementById('project-filter');
+  if (data.availableProjects && data.availableProjects.length > 1) {
+    projectFilterEl.style.display = 'flex';
+    projectFilterEl.innerHTML =
+      '<button class="'+(activeProject===null?'active':'')+'" onclick="setProject(null)">All projects</button>' +
+      data.availableProjects.map(p =>
+        '<button class="'+(activeProject===p?'active':'')+'" onclick="setProject(\\\''+p+'\\\')" title="'+esc(p)+'">'+esc(p)+'</button>'
+      ).join('');
+  } else { projectFilterEl.style.display = 'none'; }
+
   allSessions = data.sessions;
   const sidebarQuery = document.getElementById('sidebar-search-input')?.value || '';
   if (sidebarQuery.trim()) filterSessions(sidebarQuery);
@@ -1081,6 +1196,8 @@ async function loadSessions() {
 function renderSessionList(sessions) {
   const multiUser = !!(allSessions.some(s => s.user) &&
     new Set(allSessions.map(s => s.user).filter(Boolean)).size > 1);
+  const multiProject = !!(allSessions.some(s => s.project) &&
+    new Set(allSessions.map(s => s.project).filter(Boolean)).size > 1);
 
   document.getElementById('session-list').innerHTML = sessions.map(s => {
     const cost = fmtCost(s.totalCost);
@@ -1099,6 +1216,7 @@ function renderSessionList(sessions) {
       (()=>{ const sec=secEventsBySession[s.id]||secEventsBySession[s.otelId]; return sec ? (sec.blockCount>0?'<span class="badge badge-sec-block">🛡'+sec.blockCount+'</span>':sec.askCount>0?'<span class="badge badge-sec-warn">⚠'+sec.askCount+'</span>':'') : ''; })(),
       s.otelId&&s.proxyId ? '<span class="badge badge-linked">linked</span>' : '',
       multiUser&&!activeUser&&s.user ? '<span class="badge badge-user">'+esc(s.user.replace(/@.*/,''))+'</span>' : '',
+      multiProject&&!activeProject&&s.project ? '<span class="badge badge-project">📁'+esc(s.project)+'</span>' : '',
     ].filter(Boolean).join('');
 
     return '<div class="session-row '+(s.id===activeId?'active':'')+'" onclick="loadSession(\\\''+s.id+'\\\')">' +
@@ -1129,6 +1247,7 @@ function initDateRange() {
 }
 
 function setUser(u) { activeUser=u; loadSessions(); }
+function setProject(p) { activeProject=p; loadSessions(); }
 
 async function loadSession(id) {
   activeId = id;
@@ -1164,6 +1283,7 @@ async function loadSession(id) {
     data.piiCount>0 ? '<span class="badge badge-pii">🔒'+data.piiCount+' PII</span>' : '',
     secBadge,
     data.user ? '<span class="badge badge-user">'+esc(data.user.replace(/@.*/,''))+'</span>' : '',
+    data.project ? '<span class="badge badge-project">📁'+esc(data.project)+'</span>' : '',
   ].filter(Boolean);
   document.getElementById('thread-header').innerHTML =
     hdrParts.join(' ')+
@@ -1443,6 +1563,26 @@ const ATLAS_NAMES_CLIENT = {
   'AML.T0051.000': 'Direct Prompt Injection',
   'AML.T0051.001': 'Indirect LLM Injection',
 };
+
+const OWASP_NAMES_CLIENT = {
+  'LLM01': 'Prompt Injection',
+  'LLM02': 'Sensitive Information Disclosure',
+  'LLM03': 'Supply Chain',
+  'LLM04': 'Data and Model Poisoning',
+  'LLM05': 'Improper Output Handling',
+  'LLM06': 'Excessive Agency',
+  'LLM07': 'System Prompt Leakage',
+  'LLM08': 'Vector and Embedding Weaknesses',
+  'LLM09': 'Misinformation',
+  'LLM10': 'Unbounded Consumption',
+};
+
+function renderOwaspBadge(category) {
+  if (!category) return '';
+  const name = OWASP_NAMES_CLIENT[category] || category;
+  const url = 'https://genai.owasp.org/llm-top-10/';
+  return '<a class="badge badge-owasp" href="'+esc(url)+'" target="_blank" rel="noopener" title="'+esc(name)+'">'+esc(category)+'</a>';
+}
 
 function renderAtlasBadge(technique) {
   if (!technique) return '';
@@ -1830,8 +1970,8 @@ function renderSecurityDashboard(stats, events) {
     '<div class="sec-stat-card"><div class="'+cls+'">'+val+'</div><div class="sl">'+esc(label)+'</div></div>'
   ).join('');
 
-  const subtabs = ['events','atlas','proxy'].map(t =>
-    '<button class="'+(t===_secDashTab?'active':'')+'" onclick="secSubTab(\\\''+t+'\\\')">'+(t==='events'?'All Events':t==='atlas'?'By ATLAS':'Proxy Findings')+'</button>'
+  const subtabs = SEC_SUBTABS.map(t =>
+    '<button class="'+(t===_secDashTab?'active':'')+'" onclick="secSubTab(\\\''+t+'\\\')">'+esc(SEC_SUBTAB_LABELS[t])+'</button>'
   ).join('');
 
   document.getElementById('thread').innerHTML =
@@ -1845,14 +1985,25 @@ function secSubTab(tab) {
   const bodyEl = document.getElementById('sec-body');
   if (!bodyEl) return;
   document.querySelectorAll('.sec-subtabs button').forEach(b =>
-    b.classList.toggle('active', b.textContent === (tab==='events'?'All Events':tab==='atlas'?'By ATLAS':'Proxy Findings'))
+    b.classList.toggle('active', b.textContent === SEC_SUBTAB_LABELS[tab])
   );
   bodyEl.innerHTML = renderSecSubTab(tab, _secStats, _secEvents);
 }
 
+const SEC_SUBTABS = ['events','atlas','owasp','proxy','secrets'];
+const SEC_SUBTAB_LABELS = {
+  events: 'All Events',
+  atlas: 'By ATLAS',
+  owasp: 'By OWASP',
+  proxy: 'Proxy Findings',
+  secrets: 'Secrets',
+};
+
 function renderSecSubTab(tab, stats, events) {
   if (tab === 'atlas') return renderAtlasBreakdown(stats);
+  if (tab === 'owasp') return renderOwaspBreakdown(stats);
   if (tab === 'proxy') return renderProxyBreakdown(stats);
+  if (tab === 'secrets') return renderSecretsBreakdown(stats);
   return renderEventsTable(events);
 }
 
@@ -1862,6 +2013,7 @@ function renderEventsTable(events) {
     const decCls = ev.decision === 'block' ? 'dec-block' : ev.decision === 'ask' ? 'dec-ask' : 'dec-allow';
     const matchBadges = (ev.matches||[]).map(m => renderMatchTypeBadge(m.type)).join('');
     const atlasBadges = (ev.atlasTechniques||[]).map(t => renderAtlasBadge(t.id)).join(' ');
+    const owaspBadges = (ev.owaspCategories||[]).map(c => renderOwaspBadge(c.id)).join(' ');
     const sid = ev.sessionId ? ev.sessionId.slice(0,8) : '—';
     return '<tr>'+
       '<td style="white-space:nowrap;color:var(--text3);font-size:11px">'+esc(fmtTime(ev.ts))+'</td>'+
@@ -1871,10 +2023,11 @@ function renderEventsTable(events) {
       '<td><span class="'+decCls+'">'+esc(ev.decision)+'</span></td>'+
       '<td>'+matchBadges+'</td>'+
       '<td>'+atlasBadges+'</td>'+
+      '<td>'+owaspBadges+'</td>'+
       '</tr>';
   }).join('');
   return '<table class="sec-table"><thead><tr>'+
-    '<th>Time</th><th>Session</th><th>Hook</th><th>Tool</th><th>Decision</th><th>Match Types</th><th>ATLAS</th>'+
+    '<th>Time</th><th>Session</th><th>Hook</th><th>Tool</th><th>Decision</th><th>Match Types</th><th>ATLAS</th><th>OWASP</th>'+
     '</tr></thead><tbody>'+rows+'</tbody></table>';
 }
 
@@ -1892,6 +2045,48 @@ function renderAtlasBreakdown(stats) {
       '<span class="sec-atlas-count">'+count+'</span>'+
       '</div>';
   }).join('')+'</div>';
+}
+
+function renderOwaspBreakdown(stats) {
+  const entries = Object.entries(stats?.byOwaspCategory||{}).sort((a,b)=>b[1]-a[1]);
+  if (!entries.length) return '<div style="color:var(--text3);padding:20px">No OWASP category mappings found.</div>';
+  const max = entries[0][1];
+  return '<div style="padding-top:10px">'+entries.map(([cid, count]) => {
+    const name = OWASP_NAMES_CLIENT[cid] || cid;
+    const pct = Math.round((count/max)*100);
+    return '<div class="sec-atlas-row">'+
+      renderOwaspBadge(cid)+
+      '<span style="font-size:12px;color:var(--text2)">'+esc(name)+'</span>'+
+      '<div class="sec-atlas-bar" style="width:'+pct+'px"></div>'+
+      '<span class="sec-atlas-count">'+count+'</span>'+
+      '</div>';
+  }).join('')+'</div>';
+}
+
+function renderSecretsBreakdown(stats) {
+  const s = stats?.secrets || { blocked: 0, tokenizedInFlight: 0, piiNoise: 0, recentBlocked: [] };
+  const cards = [
+    ['sv red', s.blocked, 'Secrets Blocked'],
+    ['sv green', s.tokenizedInFlight, 'Tokenized In-Flight'],
+    ['sv amber', s.piiNoise, 'PII Noise'],
+  ].map(([cls, val, label]) =>
+    '<div class="sec-stat-card"><div class="'+cls+'">'+val+'</div><div class="sl">'+esc(label)+'</div></div>'
+  ).join('');
+
+  const rows = (s.recentBlocked||[]).map(ev => {
+    const sid = ev.sessionId ? ev.sessionId.slice(0,8) : '—';
+    return '<tr>'+
+      '<td style="white-space:nowrap;color:var(--text3);font-size:11px">'+esc(fmtTime(ev.ts))+'</td>'+
+      '<td><span class="session-link" onclick="switchToSession(\\\''+esc(ev.sessionId)+'\\\')">'+esc(sid)+'…</span></td>'+
+      '<td>'+renderMatchTypeBadge(ev.scannerId)+'</td>'+
+      '</tr>';
+  }).join('');
+
+  const table = rows
+    ? '<table class="sec-table"><thead><tr><th>Time</th><th>Session</th><th>Scanner</th></tr></thead><tbody>'+rows+'</tbody></table>'
+    : '<div style="color:var(--text3);padding:20px">No blocked secrets in this date range.</div>';
+
+  return '<div class="sec-stats-grid" style="padding:10px 0">'+cards+'</div>'+table;
 }
 
 function renderProxyBreakdown(stats) {
@@ -1937,7 +2132,7 @@ Bun.serve({
     const endTs = url.searchParams.get("end") ?? undefined;
 
     if (url.pathname === "/api/sessions") {
-      return handleSessions(source, url.searchParams.get("user") ?? undefined, startTs, endTs);
+      return handleSessions(source, url.searchParams.get("user") ?? undefined, startTs, endTs, url.searchParams.get("project") ?? undefined);
     }
     if (url.pathname.startsWith("/api/sessions/")) {
       return handleSession(decodeURIComponent(url.pathname.slice(14)), source, startTs, endTs);
