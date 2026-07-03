@@ -1205,7 +1205,7 @@ async function loadSession(id, target) {
   const toolCnt = evts.filter(e=>e.kind==='tool').length;
   const hookCnt = evts.filter(e=>e.kind==='hook').length;
   const secFindings = data.findings ?? [];
-  const secretsFindings = secFindings.filter(f=>f.scannerId==='secrets');
+  const secretsFindings = secFindings.filter(f=>f.scannerId.startsWith('privacy/api_key'));
   const secDecision = data.securityDecision ?? 'allow';
   const secBadge = secFindings.length > 0
     ? (secDecision==='block'
@@ -1624,7 +1624,7 @@ function renderProxyMessage(msg, callMap, ts, idx, findings) {
     ? findings.filter(f => idx >= f.fromMessageIndex && idx <= f.toMessageIndex)
     : [];
   const markerHtml = covering.map(f => {
-    const isSecret = f.scannerId === 'secrets';
+    const isSecret = f.scannerId.startsWith('privacy/api_key');
     return '<span class="finding-marker" data-cat="findings" data-ts="'+esc(f.ts||'')+'" title="'+esc(f.description||'')+'">🛡</span>'+
       (isSecret ? '<span class="finding-marker" data-cat="secrets" data-ts="'+esc(f.ts||'')+'" title="'+esc(f.description||'')+'">🔑</span>' : '');
   }).join('');
