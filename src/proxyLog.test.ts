@@ -12,7 +12,7 @@ const logPath = join(dir, "prompts.jsonl");
 process.env.LOG_PATH = logPath;
 process.env.LOOKBACK_DAYS = "36500"; // effectively disable date-based pruning for these tests
 
-const { segmentProxySessions, resolveProxySessionMessages, readProxyEntries } = await import("./proxyLog.js");
+const { segmentProxySessions, resolveProxySessionMessages, readProxyEntries, deriveMessageTimestamps } = await import("./proxyLog.js");
 
 type RawEntry = {
   ts: string;
@@ -96,6 +96,10 @@ describe("proxyLog: golden-diff — index + hydrate reproduces the pre-split beh
       { role: "user", content: "<p>first user prompt</p>" },
       { role: "assistant", content: { type: "assistant reply" } },
     ]);
+
+    expect(s.entryTimestamps).toEqual([
+      { ts: "2026-06-01T00:00:00.000Z", tokenizedLength: 2 },
+    ]);
   });
 
   test("multi-entry session (within gap window): groups, picks longest as bestRef, sums piiCount, worst-cases decision", () => {
@@ -130,6 +134,16 @@ describe("proxyLog: golden-diff — index + hydrate reproduces the pre-split beh
     expect(s.piiCount).toBe(3); // 1 + 2
     expect(s.securityDecision).toBe("block");
     expect(s.findings).toHaveLength(1);
+    // The finding was raised on the second entry (tokenizedLength 4), whose
+    // snapshot added messages 2-3 over the first entry's snapshot (length 2).
+    expect(s.findings![0].fromMessageIndex).toBe(2);
+    expect(s.findings![0].toMessageIndex).toBe(3);
+    expect(s.findings![0].ts).toBe(new Date(base + 5 * 60_000).toISOString());
+
+    expect(s.entryTimestamps).toEqual([
+      { ts: new Date(base).toISOString(), tokenizedLength: 2 },
+      { ts: new Date(base + 5 * 60_000).toISOString(), tokenizedLength: 4 },
+    ]);
 
     const messages = resolveProxySessionMessages(s.bestRef);
     expect(messages).toHaveLength(4);
@@ -144,6 +158,9 @@ describe("proxyLog: golden-diff — index + hydrate reproduces the pre-split beh
     ]);
     const sessions = segmentProxySessions();
     expect(sessions).toHaveLength(2);
+    // Sorted lastTs-descending: sessions[0] is the later split, sessions[1] the earlier one.
+    expect(sessions[0].entryTimestamps).toEqual([{ ts: new Date(base + 100 * 60_000).toISOString(), tokenizedLength: 2 }]);
+    expect(sessions[1].entryTimestamps).toEqual([{ ts: new Date(base).toISOString(), tokenizedLength: 2 }]);
   });
 
   test("startTs/endTs filtering narrows the index-only pass the same way it did the old single-pass one", () => {
@@ -194,5 +211,36 @@ describe("proxyLog: hydration failure modes", () => {
     swapFixture([{ ts: "2026-06-05T00:00:00.000Z", sessionId: "s2", matchCount: 0, tokenized: ["b"] }]);
     const sessions = segmentProxySessions();
     expect(sessions.find((s) => s.id === "2026-06-01T00:00:00.000Z")).toBeUndefined();
+  });
+});
+
+describe("deriveMessageTimestamps", () => {
+  test("labels each message with the earliest entry snapshot that already contained it", () => {
+    const entryTimestamps = [
+      { ts: "2026-06-01T00:00:00.000Z", tokenizedLength: 2 },
+      { ts: "2026-06-01T00:05:00.000Z", tokenizedLength: 4 },
+    ];
+    const result = deriveMessageTimestamps(entryTimestamps, 4, "2026-06-01T00:05:00.000Z");
+    expect(result).toEqual([
+      "2026-06-01T00:00:00.000Z",
+      "2026-06-01T00:00:00.000Z",
+      "2026-06-01T00:05:00.000Z",
+      "2026-06-01T00:05:00.000Z",
+    ]);
+  });
+
+  test("falls back to lastTs when messageCount exceeds every recorded snapshot", () => {
+    const entryTimestamps = [{ ts: "2026-06-01T00:00:00.000Z", tokenizedLength: 2 }];
+    const result = deriveMessageTimestamps(entryTimestamps, 3, "2026-06-01T00:10:00.000Z");
+    expect(result).toEqual([
+      "2026-06-01T00:00:00.000Z",
+      "2026-06-01T00:00:00.000Z",
+      "2026-06-01T00:10:00.000Z",
+    ]);
+  });
+
+  test("empty entryTimestamps falls back to lastTs for every message", () => {
+    const result = deriveMessageTimestamps([], 2, "2026-06-01T00:10:00.000Z");
+    expect(result).toEqual(["2026-06-01T00:10:00.000Z", "2026-06-01T00:10:00.000Z"]);
   });
 });

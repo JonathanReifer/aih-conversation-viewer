@@ -59,6 +59,17 @@ export type ProxyMessagesRef = {
   sessionId: string;
 };
 
+// A finding attributed to the message range that was newly added between the
+// previous log snapshot and the one this finding was raised on — a raw entry
+// is a snapshot of the whole conversation so far, not a single new message,
+// so "which message triggered this" is a range, collapsing to one message
+// when only one was added since the prior entry.
+export type ProxySessionFinding = ProxyLogFinding & {
+  fromMessageIndex: number;
+  toMessageIndex: number;
+  ts: string;
+};
+
 export type ProxySessionIndex = {
   id: string;
   firstTs: string;
@@ -67,11 +78,34 @@ export type ProxySessionIndex = {
   messageCount: number;
   piiCount: number;
   firstPrompt: string;
-  findings?: ProxyLogFinding[];
+  findings?: ProxySessionFinding[];
   securityDecision?: "allow" | "ask" | "block";
   project?: string;
   bestRef: ProxyMessagesRef;
+  // Per-entry (ts, tokenizedLength) snapshots, ts-ascending — lets
+  // deriveMessageTimestamps label each message with the earliest snapshot
+  // that already contained it.
+  entryTimestamps: { ts: string; tokenizedLength: number }[];
 };
+
+// Labels each message index with the earliest entry snapshot that already
+// contained it ("became visible no later than this ts") — exact per-message
+// timestamps don't exist since one log entry snapshots the whole
+// conversation at once. Single forward two-pointer walk: both messageCount's
+// index and entryTimestamps are monotonic, so `j` never needs to reset.
+export function deriveMessageTimestamps(
+  entryTimestamps: { ts: string; tokenizedLength: number }[],
+  messageCount: number,
+  lastTs: string
+): string[] {
+  const result: string[] = [];
+  let j = 0;
+  for (let i = 0; i < messageCount; i++) {
+    while (j < entryTimestamps.length && entryTimestamps[j].tokenizedLength <= i) j++;
+    result.push(j < entryTimestamps.length ? entryTimestamps[j].ts : lastTs);
+  }
+  return result;
+}
 
 export function parseContent(s: string): MessageContent {
   try { return JSON.parse(s) as MessageContent; } catch { return s; }
@@ -154,7 +188,22 @@ export function segmentProxySessions(startTs?: string, endTs?: string): ProxySes
   return groups.map((group): ProxySessionIndex => {
     const best = group.reduce((a, b) => a.tokenizedLength >= b.tokenizedLength ? a : b);
     const sorted = [...group].sort((a, b) => a.ts.localeCompare(b.ts));
-    const allFindings = group.flatMap(e => e.findings ?? []);
+    const entryTimestamps = sorted.map(e => ({ ts: e.ts, tokenizedLength: e.tokenizedLength }));
+
+    // Each entry is a snapshot of the whole conversation so far; attribute
+    // its findings to whatever message range is newly added since the prior
+    // entry's snapshot (prevLength..tokenizedLength-1), not to the whole group.
+    let prevLength = 0;
+    const allFindings: ProxySessionFinding[] = [];
+    for (const e of sorted) {
+      const from = prevLength;
+      const to = Math.max(from, e.tokenizedLength - 1);
+      if (e.findings) {
+        for (const f of e.findings) allFindings.push({ ...f, fromMessageIndex: from, toMessageIndex: to, ts: e.ts });
+      }
+      prevLength = e.tokenizedLength;
+    }
+
     const worstDecision = group.reduce((worst: "allow" | "ask" | "block", e) => {
       if (e.decision === "block" || worst === "block") return "block";
       if (e.decision === "ask" || worst === "ask") return "ask";
@@ -168,6 +217,7 @@ export function segmentProxySessions(startTs?: string, endTs?: string): ProxySes
       messageCount: best.tokenizedLength,
       piiCount: group.reduce((n, e) => n + e.matchCount, 0),
       firstPrompt: best.firstPromptFragment,
+      entryTimestamps,
       ...(allFindings.length > 0 ? { findings: allFindings, securityDecision: worstDecision } : {}),
       project: lookupProject(sorted[0].sessionId),
       bestRef: { byteOffset: best.byteOffset, byteLength: best.byteLength, ts: best.ts, sessionId: best.sessionId },

@@ -6,6 +6,7 @@ import {
   readProxyEntries,
   segmentProxySessions,
   resolveProxySessionMessages,
+  deriveMessageTimestamps,
   type ProxyIndexEntry,
   type ProxySessionIndex,
 } from "./proxyLog.js";
@@ -673,29 +674,36 @@ async function handleSession(id: string, source: Source, startTs?: string, endTs
     if (!s) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "content-type": "application/json" } });
     const messages = resolveProxySessionMessages(s.bestRef);
     if (!messages) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "content-type": "application/json" } });
+    const messageTimestamps = deriveMessageTimestamps(s.entryTimestamps, messages.length, s.lastTs);
     const auditEvents = getAuditEntriesForSession(allAudit, id, s.firstTs, s.lastTs);
-    return new Response(JSON.stringify({ id, source: "proxy", model: s.model, project: s.project, piiCount: s.piiCount, messages, findings: s.findings ?? [], securityDecision: s.securityDecision ?? "allow", auditEvents }), { headers: { "content-type": "application/json" } });
+    return new Response(JSON.stringify({ id, source: "proxy", model: s.model, project: s.project, piiCount: s.piiCount, messages, messageTimestamps, findings: s.findings ?? [], securityDecision: s.securityDecision ?? "allow", auditEvents }), { headers: { "content-type": "application/json" } });
   }
 
   // unified — try proxy first (has full content), enrich with OTEL
   const [events, proxySessions] = await Promise.all([fetchOtelEvents(undefined, startTs, endTs), Promise.resolve(segmentProxySessions(startTs, endTs))]);
   const otelSessions = buildOtelSessions(events);
   const unified = correlate(otelSessions, proxySessions);
-  const us = unified.find((u) => u.id === id) as UnifiedSession | undefined;
+  // Match on any of the three id forms: a session with a proxy match carries
+  // its proxy-format ts as `id` (see correlate()), so a caller holding the
+  // otel-format id (e.g. from an OTEL-only view or an audit event) would
+  // otherwise 404 even though the session exists.
+  const us = unified.find((u) => u.id === id || u.otelId === id || u.proxyId === id) as UnifiedSession | undefined;
   if (!us) return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: { "content-type": "application/json" } });
 
   const otelTimeline = us.otelSession ? buildOtelTimeline(us.otelSession.events) : [];
   const messages = us.proxySession ? (resolveProxySessionMessages(us.proxySession.bestRef) ?? []) : [];
+  const messageTimestamps = us.proxySession ? deriveMessageTimestamps(us.proxySession.entryTimestamps, messages.length, us.proxySession.lastTs) : [];
   // use otelId for exact session match when available, fall back to time window
   const sessionIdForAudit = us.otelId ?? id;
   const auditEvents = getAuditEntriesForSession(allAudit, sessionIdForAudit, us.firstTs, us.lastTs);
 
   return new Response(JSON.stringify({
-    id, source: "unified",
+    id: us.id, source: "unified",
     user: us.user, project: us.project, model: us.model, totalCost: us.totalCost, totalTokens: us.totalTokens,
     otelId: us.otelId, proxyId: us.proxyId,
     piiCount: us.piiCount ?? 0,
     messages,
+    messageTimestamps,
     otelEvents: otelTimeline,
     findings: us.proxySession?.findings ?? [],
     securityDecision: us.proxySession?.securityDecision ?? "allow",
@@ -798,7 +806,9 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, Bl
 .badge-pii { background: var(--error-bg); color: var(--error-color); }
 .badge-sec-block { background: #7c1d1d; color: #fca5a5; }
 .badge-sec-warn { background: #78350f; color: #fcd34d; }
+.badge-secrets { background: #78350f; color: #fcd34d; }
 .badge-linked { background: var(--surface3); color: var(--success-color); }
+.badge[data-cat] { cursor: pointer; }
 
 /* Theme toggle */
 #theme-btn { position: absolute; right: 12px; top: 10px; font-size: 16px; background: none; border: none; cursor: pointer; opacity: 0.7; }
@@ -826,6 +836,12 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, Bl
 #event-filters.active { display: flex; }
 #event-filters button { font-size: 10px; padding: 2px 7px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--text2); cursor: pointer; transition: all 0.1s; }
 #event-filters button.on { background: var(--surface3); color: var(--accent); border-color: var(--accent2); }
+
+/* Category nav bar */
+#cat-nav-bar { display: none; position: fixed; bottom: 18px; right: 24px; gap: 8px; align-items: center; background: var(--surface3); border: 1px solid var(--border); border-radius: 10px; padding: 6px 10px; font-size: 12px; color: var(--text2); box-shadow: 0 2px 10px rgba(0,0,0,0.3); z-index: 50; }
+#cat-nav-bar.active { display: flex; }
+#cat-nav-bar button { font-size: 12px; padding: 1px 7px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text2); cursor: pointer; }
+#cat-nav-bar .cnb-count { color: var(--text3); font-size: 11px; white-space: nowrap; }
 
 /* PII marks */
 mark.pii-hit { background: #7c3aed33; color: inherit; border-radius: 2px; padding: 0 1px; }
@@ -899,6 +915,9 @@ mark.search-active { background: #f59e0b; color: #000; outline: 2px solid #f59e0
 .msg.user { align-self: flex-end; align-items: flex-end; }
 .msg.assistant { align-self: flex-start; align-items: flex-start; }
 .msg-role { font-size: 10px; color: var(--text3); margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.05em; }
+.msg-ts { text-transform: none; letter-spacing: normal; font-weight: normal; margin-left: 6px; color: var(--text3); }
+.finding-marker { cursor: pointer; margin-left: 4px; }
+.cat-active { outline: 2px solid var(--accent2); border-radius: 4px; }
 .bubble { padding: 9px 13px; border-radius: 12px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-width: 100%; }
 .msg.user .bubble { background: var(--user-bubble); color: var(--text); border-bottom-right-radius: 3px; }
 .msg.assistant .bubble { background: var(--asst-bubble); color: var(--text); border-bottom-left-radius: 3px; }
@@ -1009,6 +1028,13 @@ body.hide-error .tl-error { display: none !important; }
   </div>
   <div id="thread"><div class="empty">← Select a conversation to view</div></div>
 </div>
+<div id="cat-nav-bar">
+  <span class="cnb-label" id="cnb-label"></span>
+  <span class="cnb-count" id="cnb-count"></span>
+  <button onclick="advanceCategory(-1)">‹</button>
+  <button onclick="advanceCategory(1)">›</button>
+  <button onclick="clearCategoryNav()">✕</button>
+</div>
 
 <script>
 let activeId = null;
@@ -1060,9 +1086,9 @@ function setView(view) {
   }
 }
 
-function switchToSession(id) {
+function switchToSession(id, target) {
   setSource('unified');
-  loadSession(id);
+  loadSession(id, target);
 }
 
 async function loadSessions() {
@@ -1160,7 +1186,7 @@ function initDateRange() {
 function setUser(u) { activeUser=u; loadSessions(); }
 function setProject(p) { activeProject=p; loadSessions(); }
 
-async function loadSession(id) {
+async function loadSession(id, target) {
   activeId = id;
   document.querySelectorAll('.session-row').forEach(r => {
     r.classList.toggle('active', r.getAttribute('onclick')?.includes("'"+id+"'"));
@@ -1179,20 +1205,25 @@ async function loadSession(id) {
   const toolCnt = evts.filter(e=>e.kind==='tool').length;
   const hookCnt = evts.filter(e=>e.kind==='hook').length;
   const secFindings = data.findings ?? [];
+  const secretsFindings = secFindings.filter(f=>f.scannerId==='secrets');
   const secDecision = data.securityDecision ?? 'allow';
   const secBadge = secFindings.length > 0
     ? (secDecision==='block'
-        ? '<span class="badge badge-sec-block">🛡 '+secFindings.length+' blocked</span>'
-        : '<span class="badge badge-sec-warn">⚠ '+secFindings.length+' finding'+(secFindings.length>1?'s':'')+'</span>')
+        ? '<span class="badge badge-sec-block" data-cat="findings" onclick="selectCategory(\\\'findings\\\')">🛡 '+secFindings.length+' blocked</span>'
+        : '<span class="badge badge-sec-warn" data-cat="findings" onclick="selectCategory(\\\'findings\\\')">⚠ '+secFindings.length+' finding'+(secFindings.length>1?'s':'')+'</span>')
+    : '';
+  const secretsBadge = secretsFindings.length > 0
+    ? '<span class="badge badge-secrets" data-cat="secrets" onclick="selectCategory(\\\'secrets\\\')">🔑'+secretsFindings.length+' secrets</span>'
     : '';
   const hdrParts = [
     data.model&&data.model!=='unknown' ? '<span class="badge badge-model">'+esc(data.model)+'</span>' : '',
     data.source==='otel' ? (evts.filter(e=>e.kind==='prompt').length+' prompts') : (data.messages?.length??0)+' msgs',
-    toolCnt>0 ? '<span class="badge badge-tools">🔧'+toolCnt+' tools</span>' : '',
+    toolCnt>0 ? '<span class="badge badge-tools" data-cat="tools" onclick="selectCategory(\\\'tools\\\')">🔧'+toolCnt+' tools</span>' : '',
     hookCnt>0 ? '<span style="color:var(--text3);font-size:11px">⚙'+hookCnt+'</span>' : '',
     cost ? '<span class="badge badge-cost">'+esc(cost)+'</span>' : '',
-    data.piiCount>0 ? '<span class="badge badge-pii">🔒'+data.piiCount+' PII</span>' : '',
+    data.piiCount>0 ? '<span class="badge badge-pii" data-cat="pii" onclick="selectCategory(\\\'pii\\\')">🔒'+data.piiCount+' PII</span>' : '',
     secBadge,
+    secretsBadge,
     data.user ? '<span class="badge badge-user">'+esc(data.user.replace(/@.*/,''))+'</span>' : '',
     data.project ? '<span class="badge badge-project">📁'+esc(data.project)+'</span>' : '',
   ].filter(Boolean);
@@ -1224,13 +1255,13 @@ async function loadSession(id) {
   if (data.source === 'otel') {
     thread.innerHTML = renderAuditEventsPanel(auditEvents) + renderRiskPackages(otelEvts) + data.events.map(renderOtelEvent).join('');
   } else if (data.source === 'proxy') {
-    thread.innerHTML = renderSecurityFindings(data.findings) + renderAuditEventsPanel(auditEvents) + data.messages.map(m=>renderProxyMessage(m,null)).join('');
+    thread.innerHTML = renderSecurityFindings(data.findings) + renderAuditEventsPanel(auditEvents) + data.messages.map((m,i)=>renderProxyMessage(m,null,data.messageTimestamps?.[i],i,data.findings)).join('');
   } else {
     // unified: proxy messages as base, OTEL events interleaved
     thread.innerHTML = renderSecurityFindings(data.findings) + renderAuditEventsPanel(auditEvents) + renderRiskPackages(otelEvts) + renderUnified(data);
   }
   thread.scrollTop = thread.scrollHeight;
-  setTimeout(() => { scanPii(); }, 50);
+  setTimeout(() => { scanPii(); populateCategoryHits(); if (target) jumpToTarget(target); }, 50);
   loadSessions();
 }
 
@@ -1339,7 +1370,7 @@ function renderToolCard(toolName, input, resultSizeBytes, success, decision, ts,
   const cls = 'tl-tool'+(isBlocked?' tool-blocked':'')+(!executed&&executed!==undefined?' tool-not-executed':'');
   const showDecisionBadge = decisionLabel!=='auto';
 
-  return '<div class="'+cls+'">'+
+  return '<div class="'+cls+'" data-cat="tools" data-ts="'+esc(ts||'')+'">'+
     '<div class="tool-header" onclick="toggleTool(\\\''+uid+'\\\')">'+
     '<span class="tool-name">'+icon+' '+esc(toolName)+'</span>'+
     (showDecisionBadge ? '<span class="tool-decision '+esc(decisionLabel)+'">'+esc(decisionLabel)+'</span>' : '')+
@@ -1351,7 +1382,7 @@ function renderToolCard(toolName, input, resultSizeBytes, success, decision, ts,
     '</div>';
 }
 
-function renderPairedCard(callBlock, resultBlock) {
+function renderPairedCard(callBlock, resultBlock, ts) {
   if (!callBlock) {
     // Tool call is in a different message — render result-only card
     const isErr = resultBlock.is_error;
@@ -1360,7 +1391,7 @@ function renderPairedCard(callBlock, resultBlock) {
       : String(resultBlock.content||'');
     const uid = 'tc-'+Math.random().toString(36).slice(2);
     const preview = resultText.split('\\n')[0].slice(0,80);
-    return '<div class="tl-tool'+(isErr?' tool-blocked':'')+'">'+
+    return '<div class="tl-tool'+(isErr?' tool-blocked':'')+'" data-cat="tools" data-ts="'+esc(ts||'')+'">'+
       '<div class="tool-header" onclick="toggleTool(\\\''+uid+'\\\')">'+
       '<span class="tool-name">'+(isErr?'❌':'📤')+' result</span>'+
       '<span class="tool-preview">'+esc(preview)+'</span>'+
@@ -1381,7 +1412,7 @@ function renderPairedCard(callBlock, resultBlock) {
     : String(resultBlock.content||'');
   const icon = isErr ? '❌' : '🔧';
 
-  return '<div class="tl-tool'+(isErr?' tool-blocked':'')+'">'+
+  return '<div class="tl-tool'+(isErr?' tool-blocked':'')+'" data-cat="tools" data-ts="'+esc(ts||'')+'">'+
     '<div class="tool-header" onclick="toggleTool(\\\''+uid+'\\\')">'+
     '<span class="tool-name">'+icon+' '+esc(callBlock.name||'tool')+'</span>'+
     '<span class="tool-preview">'+esc(preview)+'</span>'+
@@ -1571,8 +1602,8 @@ function renderRiskPackages(otelEvents) {
 
 // ── Proxy rendering ────────────────────────────────────────────────────────
 
-function renderProxyMessage(msg, callMap) {
-  const bodyHtml = renderContent(msg.content, callMap);
+function renderProxyMessage(msg, callMap, ts, idx, findings) {
+  const bodyHtml = renderContent(msg.content, callMap, ts);
   if (!bodyHtml.trim()) return '';
   let sourceLabel = '';
   if (msg.role === 'user') {
@@ -1588,12 +1619,21 @@ function renderProxyMessage(msg, callMap) {
       sourceLabel = '<span class="msg-source typed">typed</span>';
     }
   }
+  const tsHtml = ts ? '<span class="msg-ts">'+esc(fmtTime(ts))+'</span>' : '';
+  const covering = (Number.isInteger(idx) && Array.isArray(findings))
+    ? findings.filter(f => idx >= f.fromMessageIndex && idx <= f.toMessageIndex)
+    : [];
+  const markerHtml = covering.map(f => {
+    const isSecret = f.scannerId === 'secrets';
+    return '<span class="finding-marker" data-cat="findings" data-ts="'+esc(f.ts||'')+'" title="'+esc(f.description||'')+'">🛡</span>'+
+      (isSecret ? '<span class="finding-marker" data-cat="secrets" data-ts="'+esc(f.ts||'')+'" title="'+esc(f.description||'')+'">🔑</span>' : '');
+  }).join('');
   return '<div class="msg '+msg.role+'">'+
-    '<div class="msg-role">'+msg.role+sourceLabel+'</div>'+
+    '<div class="msg-role">'+msg.role+sourceLabel+tsHtml+markerHtml+'</div>'+
     '<div class="bubble">'+bodyHtml+'</div></div>';
 }
 
-function renderContent(content, extCallMap) {
+function renderContent(content, extCallMap, ts) {
   if (typeof content === 'string') return esc(content);
   if (!Array.isArray(content)) return esc(JSON.stringify(content));
 
@@ -1615,12 +1655,12 @@ function renderContent(content, extCallMap) {
     if (block.type === 'tool_use') {
       if (consumed.has(block.id)) return ''; // already rendered inside its paired result card
       // No result found yet — render as standalone call card
-      return renderToolCard(block.name||'tool', block.input, 0, true, 'accept', null, 0, undefined);
+      return renderToolCard(block.name||'tool', block.input, 0, true, 'accept', ts, 0, undefined);
     }
     if (block.type === 'tool_result') {
       const call = toolUseById[block.tool_use_id];
       if (call) consumed.add(call.id);
-      return renderPairedCard(call||null, block);
+      return renderPairedCard(call||null, block, ts);
     }
     return '';
   }).filter(Boolean).join('');
@@ -1659,8 +1699,10 @@ function renderUnified(data) {
 
   // Render proxy messages; inject OTEL cost bars after assistant turns
   let lastAssistantMin = null;
-  for (const msg of data.messages||[]) {
-    const rendered = renderProxyMessage(msg, null);
+  const msgs = data.messages||[];
+  for (let mi = 0; mi < msgs.length; mi++) {
+    const msg = msgs[mi];
+    const rendered = renderProxyMessage(msg, null, data.messageTimestamps?.[mi], mi, data.findings);
     if (!rendered) continue;
     html += rendered;
 
@@ -1771,10 +1813,14 @@ function navSearch(dir) {
   activateHit(searchIdx);
 }
 
-// ── PII navigation ─────────────────────────────────────────────────────────
+// ── Category navigation (pii / tools / secrets / findings) ────────────────
 
-let piiHits = [];
-let piiIdx = -1;
+let categoryHits = { pii: [], tools: [], secrets: [], findings: [] };
+let categoryIdx = { pii: -1, tools: -1, secrets: -1, findings: -1 };
+let activeCategory = null;
+
+const CAT_LABELS = { pii: '🔒 PII', tools: '🔧 Tools', secrets: '🔑 Secrets', findings: '🛡 Findings' };
+
 const PII_PATTERNS = [
   /\\b[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}\\b/g,
   /\\b\\d{3}[-.\\s]?\\d{3}[-.\\s]?\\d{4}\\b/g,
@@ -1782,14 +1828,14 @@ const PII_PATTERNS = [
 ];
 
 function scanPii() {
-  piiHits = []; piiIdx = -1;
+  categoryHits.pii = [];
   const thread = document.getElementById('thread');
   PII_PATTERNS.forEach(pat => {
     highlightPiiInNode(thread, pat);
   });
-  piiHits = [...document.querySelectorAll('mark.pii-hit')];
+  categoryHits.pii = [...document.querySelectorAll('mark.pii-hit')];
   const piiBtn = document.getElementById('pii-nav-btn');
-  if (piiBtn) piiBtn.textContent = piiHits.length ? '🔒'+piiHits.length : '';
+  if (piiBtn) piiBtn.textContent = categoryHits.pii.length ? '🔒'+categoryHits.pii.length : '';
 }
 
 function highlightPiiInNode(node, pattern) {
@@ -1812,12 +1858,73 @@ function highlightPiiInNode(node, pattern) {
   [...node.childNodes].forEach(child => highlightPiiInNode(child, pattern));
 }
 
-function nextPii() {
-  if (!piiHits.length) return;
-  piiIdx = (piiIdx + 1) % piiHits.length;
-  document.querySelectorAll('mark.pii-hit').forEach((m,i) => m.className = i===piiIdx?'pii-active':'pii-hit');
-  piiHits = [...document.querySelectorAll('mark.pii-hit,mark.pii-active')];
-  if (piiHits[piiIdx]) piiHits[piiIdx].scrollIntoView({block:'center'});
+function populateCategoryHits() {
+  categoryHits.tools = [...document.querySelectorAll('[data-cat="tools"]')];
+  categoryHits.secrets = [...document.querySelectorAll('[data-cat="secrets"]')];
+  categoryHits.findings = [...document.querySelectorAll('[data-cat="findings"]')];
+}
+
+function selectCategory(cat) {
+  const hits = categoryHits[cat];
+  if (!hits || !hits.length) return;
+  activeCategory = cat;
+  categoryIdx[cat] = -1;
+  advanceCategory(1);
+}
+
+function advanceCategory(dir) {
+  const cat = activeCategory;
+  const hits = cat && categoryHits[cat];
+  if (!hits || !hits.length) return;
+  const prev = hits[categoryIdx[cat]];
+  if (prev) prev.classList.remove('cat-active', 'pii-active');
+  categoryIdx[cat] = ((categoryIdx[cat] + dir) % hits.length + hits.length) % hits.length;
+  const el = hits[categoryIdx[cat]];
+  if (!el) return;
+  el.classList.add(cat === 'pii' ? 'pii-active' : 'cat-active');
+  el.scrollIntoView({block:'center'});
+  document.getElementById('cnb-label').textContent = CAT_LABELS[cat] || cat;
+  document.getElementById('cnb-count').textContent = (categoryIdx[cat]+1)+' of '+hits.length;
+  document.getElementById('cat-nav-bar').classList.add('active');
+}
+
+function clearCategoryNav() {
+  const cat = activeCategory;
+  const hits = cat && categoryHits[cat];
+  const el = hits && hits[categoryIdx[cat]];
+  if (el) el.classList.remove('cat-active', 'pii-active');
+  activeCategory = null;
+  document.getElementById('cat-nav-bar').classList.remove('active');
+}
+
+function nextPii() { selectCategory('pii'); }
+
+// Jump straight to the hit nearest target.ts within target.cat — used by
+// the Security page's row click, which only has a bare event ts to correlate
+// against (no shared id between an AuditEntry row and a specific message).
+function jumpToTarget(target) {
+  if (!target || !target.cat) return;
+  const hits = categoryHits[target.cat];
+  if (!hits || !hits.length) return;
+  activeCategory = target.cat;
+  if (!target.ts) { categoryIdx[target.cat] = -1; advanceCategory(1); return; }
+  const targetMs = new Date(target.ts).getTime();
+  let bestIdx = 0, bestDelta = Infinity;
+  hits.forEach((el, i) => {
+    const elTs = el.dataset ? el.dataset.ts : null;
+    if (!elTs) return;
+    const delta = Math.abs(new Date(elTs).getTime() - targetMs);
+    if (delta < bestDelta) { bestDelta = delta; bestIdx = i; }
+  });
+  const prev = hits[categoryIdx[target.cat]];
+  if (prev) prev.classList.remove('cat-active', 'pii-active');
+  categoryIdx[target.cat] = bestIdx;
+  const el = hits[bestIdx];
+  el.classList.add(target.cat === 'pii' ? 'pii-active' : 'cat-active');
+  el.scrollIntoView({block:'center'});
+  document.getElementById('cnb-label').textContent = CAT_LABELS[target.cat] || target.cat;
+  document.getElementById('cnb-count').textContent = (bestIdx+1)+' of '+hits.length;
+  document.getElementById('cat-nav-bar').classList.add('active');
 }
 
 // ── Theme ──────────────────────────────────────────────────────────────────
@@ -1928,7 +2035,7 @@ function renderEventsTable(events) {
     const sid = ev.sessionId ? ev.sessionId.slice(0,8) : '—';
     return '<tr>'+
       '<td style="white-space:nowrap;color:var(--text3);font-size:11px">'+esc(fmtTime(ev.ts))+'</td>'+
-      '<td><span class="session-link" onclick="switchToSession(\\\''+esc(ev.sessionId)+'\\\')">'+esc(sid)+'…</span></td>'+
+      '<td><span class="session-link" onclick="switchToSession(\\\''+esc(ev.sessionId)+'\\\', {cat:\\\'findings\\\', ts:\\\''+esc(ev.ts)+'\\\'})">'+esc(sid)+'…</span></td>'+
       '<td style="font-size:11px;color:var(--text3)">'+esc(ev.hookEvent||'')+'</td>'+
       '<td style="font-family:monospace;font-size:11px">'+esc(ev.toolName||'—')+'</td>'+
       '<td><span class="'+decCls+'">'+esc(ev.decision)+'</span></td>'+
@@ -1988,7 +2095,7 @@ function renderSecretsBreakdown(stats) {
     const sid = ev.sessionId ? ev.sessionId.slice(0,8) : '—';
     return '<tr>'+
       '<td style="white-space:nowrap;color:var(--text3);font-size:11px">'+esc(fmtTime(ev.ts))+'</td>'+
-      '<td><span class="session-link" onclick="switchToSession(\\\''+esc(ev.sessionId)+'\\\')">'+esc(sid)+'…</span></td>'+
+      '<td><span class="session-link" onclick="switchToSession(\\\''+esc(ev.sessionId)+'\\\', {cat:\\\'secrets\\\', ts:\\\''+esc(ev.ts)+'\\\'})">'+esc(sid)+'…</span></td>'+
       '<td>'+renderMatchTypeBadge(ev.scannerId)+'</td>'+
       '</tr>';
   }).join('');

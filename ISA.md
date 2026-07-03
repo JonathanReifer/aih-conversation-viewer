@@ -2,7 +2,7 @@
 project: aih-conversation-viewer
 effort: E3
 phase: verify
-progress: 30/30
+progress: 39/39
 mode: algorithm
 started: 2026-07-02
 updated: 2026-07-02
@@ -74,6 +74,18 @@ Replace the uncached full-file re-read in `readProxyEntries()`/`readAuditEntries
 - [x] ISC-29: Anti: test-instance teardown — ports 4498/4497 and `/tmp/proxylog-verify/{old,new}-code` worktrees removed, leaving devops2's real production instance (PID 2070082, port 4446) untouched (both test PIDs + mock-loki killed, both worktrees removed, `git worktree list` shows only the main checkout, production instance confirmed running + `/api/sessions` returns 200)
 - [x] ISC-30: newly-discovered-during-ISC-19-verification bug fixed — `queryLoki()`'s `fetch()` in `server.ts` had no error handling, so one slow/timing-out Loki page (real Loki observed flapping `/ready` 503↔ready under production load — devops2's mock Loki always responds instantly and could never have surfaced this) threw an uncaught rejection that hung the entire `/api/sessions` request until Bun's own 10s `idleTimeout` killed the connection (`HTTP:000` to clients). Fixed with a try/catch around both the `fetch()` and `res.json()` calls (returns `[]` on any failure, mirroring the existing `if (!res.ok) return [];` sibling), a shorter 4s per-page `AbortSignal.timeout` (was 15s — exceeded Bun's own connection timeout), and a 6s wall-clock budget across `fetchOtelEvents`'s whole pagination loop as a second layer of defense. Verified: root-caused via a standalone reproduction script (bypassing Bun.serve) that caught the exact uncaught `TimeoutError` on page 2 against real Loki data; post-fix, `bun test` 26/26 still passes, and 38 real `/api/sessions` requests against production Loki on devops1 all returned `HTTP:200` (previously intermittently hung/timed out)
 
+## Phase 2 — timestamps, iterable category navigation, Security-page jump fix
+
+- [x] ISC-31: `ProxySessionIndex.entryTimestamps: {ts, tokenizedLength}[]` populated in `segmentProxySessions` from the already-sorted group, zero new I/O
+- [x] ISC-32: `deriveMessageTimestamps(entryTimestamps, messageCount, lastTs)` pure function — single forward two-pointer walk, exported and unit-tested (3 cases: mid-walk labeling, fallback-to-lastTs when count exceeds every snapshot, empty-entryTimestamps fallback)
+- [x] ISC-33: `ProxySessionFinding = ProxyLogFinding & {fromMessageIndex, toMessageIndex, ts}` — range attribution via a running `prevLength` cursor over `sorted` entries in `segmentProxySessions`'s finding aggregation
+- [x] ISC-34: `proxyLog.test.ts` additive assertions pass — `findings[0].fromMessageIndex/toMessageIndex/ts` on the multi-entry fixture, `entryTimestamps` shape/order on single-entry/multi-entry/gap-split fixtures
+- [x] ISC-35: `handleSession` API response (both proxy-only and unified branches) carries `messageTimestamps: string[]`, index-aligned with `messages`, computed via `deriveMessageTimestamps` right after hydration
+- [x] ISC-36: client renders per-message timestamps — `renderProxyMessage` threads `messageTimestamps[i]` through `fmtTime()`, proxy-context tool cards pass the containing message's real ts instead of hardcoded `null`
+- [x] ISC-37: generalized `categoryHits`/`categoryIdx`/`activeCategory` registry covering `pii`/`tools`/`secrets`/`findings` — `populateCategoryHits()`, `selectCategory(cat)` (jump-to-first + nav bar per assumption #2), `advanceCategory(dir)` (wraparound + `.cat-active` + `scrollIntoView`), `#cat-nav-bar` UI; `data-cat`/`data-ts` markup wired into `renderToolCard`/`renderPairedCard`/finding markers; header badges (`tools`/`secrets`/`findings`/`pii`) all wired to `onclick="selectCategory(...)"`; `nextPii()` reduced to a 1-line back-compat wrapper
+- [x] ISC-38: Security-page jump fix — `handleSession`'s unified-branch lookup broadened from `u.id === id` to `u.id === id || u.otelId === id || u.proxyId === id` (fixes the id-format mismatch that silently 404'd exactly the sessions richest in findings); `switchToSession(id, target)`/`loadSession(id, target)` thread an optional `{cat, ts}` target through to a new `jumpToTarget(target)` (nearest-`data-ts` match within `categoryHits[target.cat]`, mirroring the existing OTEL/proxy cost-badge nearest-time-bucket idiom); both Security-page row click handlers (`renderEventsTable` → `{cat:'findings', ts:ev.ts}`, `renderSecretsBreakdown` → `{cat:'secrets', ts:ev.ts}`) updated accordingly
+- [x] ISC-39: Anti/safety-net — isolated-copy spot-check (rsynced repo, patched `PORT`, synthetic fixture + mock-Loki, `curl` the served page, extract `<script>`, `node --check`) caught a real pre-existing bug: a `//` comment inside `jumpToTarget`'s own doc-comment (server.ts ~1902) contained literal backticks (`` `target.ts` ``/`` `target.cat` ``), which prematurely closed the *outer* server-side template literal the whole client `<script>` lives inside — same failure class as the earlier `\'`/`\\'` escaping incident, undetectable by `bun test` alone since server.ts's top-level `Bun.serve()` call means it's never imported by any test file. Fixed by rewriting the comment without backticks; re-ran the isolated instance — `node --check` clean; confirmed no other stray backticks inside the embedded-script line range (1039-2138) via `awk`; `bun test` 29/29 on the real repo post-fix; isolated instance + mock-Loki torn down, scratch copies removed, real production instance (PID 4044370, port 4446) confirmed untouched throughout (`ps -p`, `curl` HTTP:200)
+
 ## Test Strategy
 
 | ISC | Type | Check | Threshold | Tool |
@@ -90,6 +102,10 @@ Replace the uncached full-file re-read in `readProxyEntries()`/`readAuditEntries
 | ISC-18 | anti | fixture only, no real file transfer | true throughout | manual audit of commands run |
 | ISC-19 | live | devops1 post-deploy | sane counts, flat RSS, no new OOM | Bash + dmesg |
 | ISC-30 | live | Loki-resilience fix on devops1 | 38/38 real `/api/sessions` requests HTTP:200, `bun test` 26/26 | Bash + curl loop |
+| ISC-31..34 | unit | bun test suite (proxyLog.test.ts additive) | all pass | Bash `bun test` |
+| ISC-35 | code | handleSession response shape | messageTimestamps present, index-aligned | Read + curl |
+| ISC-36..38 | manual + devops2 | client rendering, category nav, security-page jump | timestamps render, nav bar steps correctly, row click lands on right message | Interceptor (devops2) |
+| ISC-39 | syntax | isolated-instance `node --check` on served `<script>` | clean, 0 errors | Bash + node --check |
 
 ## Features
 
@@ -107,3 +123,8 @@ Replace the uncached full-file re-read in `readProxyEntries()`/`readAuditEntries
 - 2026-07-02: Chose incremental byte-offset tail cache over mtime-gated whole-file cache (the `project.ts` precedent) because the log only grows — O(new bytes) beats O(file size) on every read as the file scales past GB size.
 - 2026-07-02: Deferred retention/pruning — v1 keeps full parsed history in memory forever. Unbounded but currently tens of MB, far below the multi-GB OOM signature. `prune` extension point included, unused, for future bounded retention.
 - 2026-07-02: Delegation floor met via Forge (code generation of logCache.ts/server.ts refactor) and Explore (call-site verification across server.ts).
+- 2026-07-02: "Secrets" defined as a filtered slice of `findings` (by `scannerId`), not an alias for the PII regex-scan — kept as a separate category in the nav registry rather than merged with `pii`.
+- 2026-07-02: Badge click jumps to the first instance and shows a floating nav bar ("N of M" + ‹ ›), not cycle-in-place — scales better once a category has many instances.
+- 2026-07-02: Per-message timestamps are approximate ("became visible no later than this snapshot's ts"), not exact wall-clock — a raw proxy-log entry snapshots the whole conversation at once, so exact per-message timing isn't recoverable.
+- 2026-07-02: Findings attributed to a message range (`fromMessageIndex`/`toMessageIndex`) rather than a single index, since one log entry can add more than one message since the prior snapshot.
+- 2026-07-02: Isolated-copy syntax spot-check (rsync + patched PORT + synthetic fixture, `node --check` on the extracted served script) kept as a standing pre-push safety net alongside — never instead of — real Interceptor browser verification, per this project's established incident history.
