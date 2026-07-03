@@ -1859,9 +1859,12 @@ function highlightPiiInNode(node, pattern) {
 }
 
 function populateCategoryHits() {
-  categoryHits.tools = [...document.querySelectorAll('[data-cat="tools"]')];
-  categoryHits.secrets = [...document.querySelectorAll('[data-cat="secrets"]')];
-  categoryHits.findings = [...document.querySelectorAll('[data-cat="findings"]')];
+  // Header badges reuse the same data-cat attribute (for their onclick=selectCategory
+  // wiring) as the actual per-message/per-tool-call markers — exclude .badge so the
+  // badge itself doesn't get counted as a navigable instance and inflate "N of M".
+  categoryHits.tools = [...document.querySelectorAll('[data-cat="tools"]:not(.badge)')];
+  categoryHits.secrets = [...document.querySelectorAll('[data-cat="secrets"]:not(.badge)')];
+  categoryHits.findings = [...document.querySelectorAll('[data-cat="findings"]:not(.badge)')];
 }
 
 function selectCategory(cat) {
