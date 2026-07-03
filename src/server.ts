@@ -1186,6 +1186,24 @@ function initDateRange() {
 function setUser(u) { activeUser=u; loadSessions(); }
 function setProject(p) { activeProject=p; loadSessions(); }
 
+// Mirrors renderContent's pairing logic exactly, so this count always matches
+// the actual number of data-cat="tools" cards rendered from proxy messages
+// (each tool_use is exactly one card whether standalone or paired with its
+// result; each orphan tool_result with no matching tool_use is its own card).
+function countProxyToolCards(messages) {
+  if (!Array.isArray(messages)) return 0;
+  const blocks = [];
+  for (const m of messages) if (Array.isArray(m.content)) blocks.push(...m.content);
+  const toolUseIds = new Set(blocks.filter(b => b && b.type==='tool_use' && b.id).map(b => b.id));
+  let count = 0;
+  for (const b of blocks) {
+    if (!b) continue;
+    if (b.type === 'tool_use') count++;
+    else if (b.type === 'tool_result' && !toolUseIds.has(b.tool_use_id)) count++;
+  }
+  return count;
+}
+
 async function loadSession(id, target) {
   activeId = id;
   document.querySelectorAll('.session-row').forEach(r => {
@@ -1202,7 +1220,7 @@ async function loadSession(id, target) {
 
   const cost = fmtCost(data.totalCost);
   const evts = data.source==='otel' ? data.events : (data.otelEvents||[]);
-  const toolCnt = evts.filter(e=>e.kind==='tool').length;
+  const toolCnt = evts.filter(e=>e.kind==='tool').length + countProxyToolCards(data.messages);
   const hookCnt = evts.filter(e=>e.kind==='hook').length;
   const secFindings = data.findings ?? [];
   const secretsFindings = secFindings.filter(f=>f.scannerId.startsWith('privacy/api_key'));
