@@ -193,11 +193,18 @@ export function segmentProxySessions(startTs?: string, endTs?: string): ProxySes
     // Each entry is a snapshot of the whole conversation so far; attribute
     // its findings to whatever message range is newly added since the prior
     // entry's snapshot (prevLength..tokenizedLength-1), not to the whole group.
+    // Only `best`'s own tokenized array ever gets hydrated into `messages`
+    // (see resolveProxySessionMessages), so every range must be clamped into
+    // best's index space -- real traffic isn't always one steadily-growing
+    // conversation (many short, independent proxy calls can land in the same
+    // 90-minute group with non-monotonic tokenizedLength), which otherwise
+    // produces indices beyond the messages array actually served.
+    const maxIdx = Math.max(0, best.tokenizedLength - 1);
     let prevLength = 0;
     const allFindings: ProxySessionFinding[] = [];
     for (const e of sorted) {
-      const from = prevLength;
-      const to = Math.max(from, e.tokenizedLength - 1);
+      const from = Math.min(prevLength, maxIdx);
+      const to = Math.min(Math.max(from, e.tokenizedLength - 1), maxIdx);
       if (e.findings) {
         for (const f of e.findings) allFindings.push({ ...f, fromMessageIndex: from, toMessageIndex: to, ts: e.ts });
       }

@@ -612,7 +612,16 @@ function getAuditEntriesForSession(allEntries: AuditEntryEnriched[], sessionId: 
 
 async function handleSecurityStats(startTs?: string, endTs?: string): Promise<Response> {
   const auditEntries = readAuditEntries(startTs, endTs).map(enrichAuditEntry);
-  const proxyEntries = readProxyEntries();
+  // readProxyEntries() has no date params -- filter here so the "Proxy
+  // Findings"/"Secrets" cards respect the same date range as every audit-based
+  // card on the page. Without this, changing the date range narrowed half the
+  // dashboard's numbers and left the other half at their all-time totals.
+  const start = startTs ? new Date(startTs).getTime() : 0;
+  const end = endTs ? new Date(endTs + "T23:59:59Z").getTime() : Infinity;
+  const proxyEntries = readProxyEntries().filter((e) => {
+    const t = new Date(e.ts).getTime();
+    return t >= start && t <= end;
+  });
   return new Response(JSON.stringify(aggregateSecurityStats(auditEntries, proxyEntries)), { headers: { "content-type": "application/json" } });
 }
 
@@ -917,6 +926,8 @@ mark.search-active { background: #f59e0b; color: #000; outline: 2px solid #f59e0
 .msg-role { font-size: 10px; color: var(--text3); margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.05em; }
 .msg-ts { text-transform: none; letter-spacing: normal; font-weight: normal; margin-left: 6px; color: var(--text3); }
 .finding-marker { cursor: pointer; margin-left: 4px; }
+.finding-marker-dup { display: inline-block; width: 0; height: 0; overflow: hidden; margin: 0; }
+.finding-marker-count { font-size: 9px; vertical-align: super; margin-left: 1px; color: var(--text3); }
 .cat-active { outline: 2px solid var(--accent2); border-radius: 4px; }
 .bubble { padding: 9px 13px; border-radius: 12px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-width: 100%; }
 .msg.user .bubble { background: var(--user-bubble); color: var(--text); border-bottom-right-radius: 3px; }
@@ -1248,7 +1259,6 @@ async function loadSession(id, target) {
   document.getElementById('thread-header').innerHTML =
     hdrParts.join(' ')+
     ' <span class="session-id" title="click to copy" onclick="copyId(\\\''+id+'\\\')">'+(data.otelId||id).slice(0,8)+'…</span>'+
-    (data.piiCount>0||true ? ' <button id="pii-nav-btn" class="btn" onclick="nextPii()">🔒</button>' : '')+
     ' <button class="btn" onclick="toggleSearch()">🔍</button>'+
     ' <button id="expand-btn" class="btn" onclick="toggleAll()">Expand all</button>';
 
@@ -1583,7 +1593,7 @@ function renderAuditEventsPanel(auditEvents) {
     const decCls = ev.decision === 'block' ? 'dec-block' : ev.decision === 'ask' ? 'dec-ask' : 'dec-allow';
     const matchBadges = (ev.matches||[]).map(m => renderMatchTypeBadge(m.type)).join('');
     const atlasBadges = (ev.atlasTechniques||[]).map(t => renderAtlasBadge(t.id)).join(' ');
-    return '<div class="audit-event-row">'+
+    return '<div class="audit-event-row" data-cat="audit" data-ts="'+esc(ev.ts)+'">'+
       '<span class="ae-time">'+esc(fmtTime(ev.ts))+'</span>'+
       '<span class="'+decCls+'">'+esc(ev.decision)+'</span>'+
       '<span class="ae-hook">'+esc(ev.hookEvent)+'</span>'+
@@ -1641,11 +1651,23 @@ function renderProxyMessage(msg, callMap, ts, idx, findings) {
   const covering = (Number.isInteger(idx) && Array.isArray(findings))
     ? findings.filter(f => idx >= f.fromMessageIndex && idx <= f.toMessageIndex)
     : [];
-  const markerHtml = covering.map(f => {
-    const isSecret = f.scannerId.startsWith('privacy/api_key');
-    return '<span class="finding-marker" data-cat="findings" data-ts="'+esc(f.ts||'')+'" title="'+esc(f.description||'')+'">🛡</span>'+
-      (isSecret ? '<span class="finding-marker" data-cat="secrets" data-ts="'+esc(f.ts||'')+'" title="'+esc(f.description||'')+'">🔑</span>' : '');
-  }).join('');
+  const secretsCovering = covering.filter(f => f.scannerId.startsWith('privacy/api_key'));
+  // A message can be covered by many findings at once (esp. after collapsing a
+  // whole burst of short proxy log entries into one message range) -- render one
+  // visible glyph per category with a ×N count, not one stacked span per finding.
+  // The extras still exist as real (zero-size) DOM nodes so categoryHits/nav
+  // counts stay accurate against the header badge's raw finding count.
+  const markerGroup = (list, cat, glyph) => {
+    if (!list.length) return '';
+    const title = esc(list.map(f => f.description).filter(Boolean).join(' | '));
+    const countHtml = list.length > 1 ? '<span class="finding-marker-count">×'+list.length+'</span>' : '';
+    const visible = '<span class="finding-marker" data-cat="'+cat+'" data-ts="'+esc(list[0].ts||'')+'" title="'+title+'">'+glyph+countHtml+'</span>';
+    const hidden = list.slice(1).map(f =>
+      '<span class="finding-marker finding-marker-dup" data-cat="'+cat+'" data-ts="'+esc(f.ts||'')+'" title="'+title+'">'+glyph+'</span>'
+    ).join('');
+    return visible + hidden;
+  };
+  const markerHtml = markerGroup(covering, 'findings', '🛡') + markerGroup(secretsCovering, 'secrets', '🔑');
   return '<div class="msg '+msg.role+'">'+
     '<div class="msg-role">'+msg.role+sourceLabel+tsHtml+markerHtml+'</div>'+
     '<div class="bubble">'+bodyHtml+'</div></div>';
@@ -1837,7 +1859,7 @@ let categoryHits = { pii: [], tools: [], secrets: [], findings: [] };
 let categoryIdx = { pii: -1, tools: -1, secrets: -1, findings: -1 };
 let activeCategory = null;
 
-const CAT_LABELS = { pii: '🔒 PII', tools: '🔧 Tools', secrets: '🔑 Secrets', findings: '🛡 Findings' };
+const CAT_LABELS = { pii: '🔒 PII', tools: '🔧 Tools', secrets: '🔑 Secrets', findings: '🛡 Findings', audit: '🔐 Audit Event' };
 
 const PII_PATTERNS = [
   /\\b[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}\\b/g,
@@ -1852,8 +1874,6 @@ function scanPii() {
     highlightPiiInNode(thread, pat);
   });
   categoryHits.pii = [...document.querySelectorAll('mark.pii-hit')];
-  const piiBtn = document.getElementById('pii-nav-btn');
-  if (piiBtn) piiBtn.textContent = categoryHits.pii.length ? '🔒'+categoryHits.pii.length : '';
 }
 
 function highlightPiiInNode(node, pattern) {
@@ -1883,6 +1903,7 @@ function populateCategoryHits() {
   categoryHits.tools = [...document.querySelectorAll('[data-cat="tools"]:not(.badge)')];
   categoryHits.secrets = [...document.querySelectorAll('[data-cat="secrets"]:not(.badge)')];
   categoryHits.findings = [...document.querySelectorAll('[data-cat="findings"]:not(.badge)')];
+  categoryHits.audit = [...document.querySelectorAll('[data-cat="audit"]:not(.badge)')];
 }
 
 function selectCategory(cat) {
@@ -2056,7 +2077,7 @@ function renderEventsTable(events) {
     const sid = ev.sessionId ? ev.sessionId.slice(0,8) : '—';
     return '<tr>'+
       '<td style="white-space:nowrap;color:var(--text3);font-size:11px">'+esc(fmtTime(ev.ts))+'</td>'+
-      '<td><span class="session-link" onclick="switchToSession(\\\''+esc(ev.sessionId)+'\\\', {cat:\\\'findings\\\', ts:\\\''+esc(ev.ts)+'\\\'})">'+esc(sid)+'…</span></td>'+
+      '<td><span class="session-link" onclick="switchToSession(\\\''+esc(ev.sessionId)+'\\\', {cat:\\\'audit\\\', ts:\\\''+esc(ev.ts)+'\\\'})">'+esc(sid)+'…</span></td>'+
       '<td style="font-size:11px;color:var(--text3)">'+esc(ev.hookEvent||'')+'</td>'+
       '<td style="font-family:monospace;font-size:11px">'+esc(ev.toolName||'—')+'</td>'+
       '<td><span class="'+decCls+'">'+esc(ev.decision)+'</span></td>'+
@@ -2116,7 +2137,7 @@ function renderSecretsBreakdown(stats) {
     const sid = ev.sessionId ? ev.sessionId.slice(0,8) : '—';
     return '<tr>'+
       '<td style="white-space:nowrap;color:var(--text3);font-size:11px">'+esc(fmtTime(ev.ts))+'</td>'+
-      '<td><span class="session-link" onclick="switchToSession(\\\''+esc(ev.sessionId)+'\\\', {cat:\\\'secrets\\\', ts:\\\''+esc(ev.ts)+'\\\'})">'+esc(sid)+'…</span></td>'+
+      '<td><span class="session-link" onclick="switchToSession(\\\''+esc(ev.sessionId)+'\\\', {cat:\\\'audit\\\', ts:\\\''+esc(ev.ts)+'\\\'})">'+esc(sid)+'…</span></td>'+
       '<td>'+renderMatchTypeBadge(ev.scannerId)+'</td>'+
       '</tr>';
   }).join('');
