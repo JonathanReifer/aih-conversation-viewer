@@ -170,22 +170,19 @@ export function segmentProxySessions(startTs?: string, endTs?: string): ProxySes
   if (startTs) entries = entries.filter(e => e.ts >= startTs);
   if (endTs) entries = entries.filter(e => e.ts <= endTs + 'Z');
 
-  const GAP_MS = 90 * 60 * 1000;
-  const groups: ProxyIndexEntry[][] = [];
-  let current: ProxyIndexEntry[] = [];
-
+  // Group by sessionId rather than a time-gap heuristic -- ProxyLogEntry
+  // already carries the real session identity, and a gap heuristic
+  // incorrectly split or merged long/paused sessions. Legacy entries
+  // missing sessionId (empty string) fall back to grouping by their own ts.
+  const sessionMap = new Map<string, ProxyIndexEntry[]>();
   for (const e of entries) {
-    const prevTs = current.length ? new Date(current[current.length - 1].ts).getTime() : 0;
-    if (current.length > 0 && (new Date(e.ts).getTime() - prevTs) > GAP_MS) {
-      groups.push(current);
-      current = [e];
-    } else {
-      current.push(e);
-    }
+    const sid = e.sessionId || e.ts;
+    const arr = sessionMap.get(sid) ?? [];
+    arr.push(e);
+    sessionMap.set(sid, arr);
   }
-  if (current.length > 0) groups.push(current);
 
-  return groups.map((group): ProxySessionIndex => {
+  return Array.from(sessionMap.entries()).map(([sid, group]): ProxySessionIndex => {
     const best = group.reduce((a, b) => a.tokenizedLength >= b.tokenizedLength ? a : b);
     const sorted = [...group].sort((a, b) => a.ts.localeCompare(b.ts));
     const entryTimestamps = sorted.map(e => ({ ts: e.ts, tokenizedLength: e.tokenizedLength }));
@@ -197,7 +194,7 @@ export function segmentProxySessions(startTs?: string, endTs?: string): ProxySes
     // (see resolveProxySessionMessages), so every range must be clamped into
     // best's index space -- real traffic isn't always one steadily-growing
     // conversation (many short, independent proxy calls can land in the same
-    // 90-minute group with non-monotonic tokenizedLength), which otherwise
+    // session with non-monotonic tokenizedLength), which otherwise
     // produces indices beyond the messages array actually served.
     const maxIdx = Math.max(0, best.tokenizedLength - 1);
     let prevLength = 0;
@@ -217,7 +214,7 @@ export function segmentProxySessions(startTs?: string, endTs?: string): ProxySes
       return worst;
     }, "allow");
     return {
-      id: sorted[0].ts,
+      id: sid,
       firstTs: sorted[0].ts,
       lastTs: sorted[sorted.length - 1].ts,
       model: best.model ?? "unknown",

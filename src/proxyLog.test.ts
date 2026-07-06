@@ -83,7 +83,7 @@ describe("proxyLog: golden-diff — index + hydrate reproduces the pre-split beh
     const sessions = segmentProxySessions();
     expect(sessions).toHaveLength(1);
     const s = sessions[0];
-    expect(s.id).toBe("2026-06-01T00:00:00.000Z");
+    expect(s.id).toBe("s1");
     expect(s.model).toBe("claude-sonnet-5");
     expect(s.messageCount).toBe(2);
     expect(s.piiCount).toBe(3);
@@ -150,17 +150,46 @@ describe("proxyLog: golden-diff — index + hydrate reproduces the pre-split beh
     expect(messages![0]).toEqual({ role: "user", content: "longer turn 2 with more content" });
   });
 
-  test("entries beyond the 90-minute gap split into separate sessions", () => {
+  test("entries with different sessionIds always split, even close together in time", () => {
+    const base = new Date("2026-06-01T10:00:00.000Z").getTime();
+    swapFixture([
+      { ts: new Date(base).toISOString(), sessionId: "s1", matchCount: 0, tokenized: ["a", "b"] },
+      { ts: new Date(base + 5 * 60_000).toISOString(), sessionId: "s2", matchCount: 0, tokenized: ["c", "d"] },
+    ]);
+    const sessions = segmentProxySessions();
+    expect(sessions).toHaveLength(2);
+    // Sorted lastTs-descending: sessions[0] is the later session, sessions[1] the earlier one.
+    expect(sessions[0].id).toBe("s2");
+    expect(sessions[1].id).toBe("s1");
+    expect(sessions[0].entryTimestamps).toEqual([{ ts: new Date(base + 5 * 60_000).toISOString(), tokenizedLength: 2 }]);
+    expect(sessions[1].entryTimestamps).toEqual([{ ts: new Date(base).toISOString(), tokenizedLength: 2 }]);
+  });
+
+  test("entries sharing a sessionId group together even beyond the old 90-minute gap window", () => {
     const base = new Date("2026-06-01T10:00:00.000Z").getTime();
     swapFixture([
       { ts: new Date(base).toISOString(), sessionId: "s1", matchCount: 0, tokenized: ["a", "b"] },
       { ts: new Date(base + 100 * 60_000).toISOString(), sessionId: "s1", matchCount: 0, tokenized: ["c", "d"] },
     ]);
     const sessions = segmentProxySessions();
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].id).toBe("s1");
+    expect(sessions[0].entryTimestamps).toEqual([
+      { ts: new Date(base).toISOString(), tokenizedLength: 2 },
+      { ts: new Date(base + 100 * 60_000).toISOString(), tokenizedLength: 2 },
+    ]);
+  });
+
+  test("entries missing sessionId (legacy log lines) fall back to grouping by their own ts", () => {
+    const base = new Date("2026-06-01T10:00:00.000Z").getTime();
+    swapFixture([
+      { ts: new Date(base).toISOString(), sessionId: "", matchCount: 0, tokenized: ["a"] },
+      { ts: new Date(base + 60_000).toISOString(), sessionId: "", matchCount: 0, tokenized: ["b"] },
+    ]);
+    const sessions = segmentProxySessions();
     expect(sessions).toHaveLength(2);
-    // Sorted lastTs-descending: sessions[0] is the later split, sessions[1] the earlier one.
-    expect(sessions[0].entryTimestamps).toEqual([{ ts: new Date(base + 100 * 60_000).toISOString(), tokenizedLength: 2 }]);
-    expect(sessions[1].entryTimestamps).toEqual([{ ts: new Date(base).toISOString(), tokenizedLength: 2 }]);
+    expect(sessions[0].id).toBe(new Date(base + 60_000).toISOString());
+    expect(sessions[1].id).toBe(new Date(base).toISOString());
   });
 
   test("startTs/endTs filtering narrows the index-only pass the same way it did the old single-pass one", () => {
@@ -171,7 +200,7 @@ describe("proxyLog: golden-diff — index + hydrate reproduces the pre-split beh
     ]);
     const sessions = segmentProxySessions("2026-06-02T00:00:00.000Z", "2026-06-02");
     expect(sessions).toHaveLength(1);
-    expect(sessions[0].id).toBe("2026-06-02T00:00:00.000Z");
+    expect(sessions[0].id).toBe("s2");
   });
 });
 
@@ -210,7 +239,7 @@ describe("proxyLog: hydration failure modes", () => {
     swapFixture([{ ts: "2026-06-01T00:00:00.000Z", sessionId: "s1", matchCount: 0, tokenized: ["a"] }]);
     swapFixture([{ ts: "2026-06-05T00:00:00.000Z", sessionId: "s2", matchCount: 0, tokenized: ["b"] }]);
     const sessions = segmentProxySessions();
-    expect(sessions.find((s) => s.id === "2026-06-01T00:00:00.000Z")).toBeUndefined();
+    expect(sessions.find((s) => s.id === "s1")).toBeUndefined();
   });
 });
 

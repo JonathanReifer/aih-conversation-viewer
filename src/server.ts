@@ -388,16 +388,25 @@ type SecurityStats = {
 function correlate(otelSessions: OtelSession[], proxySessions: ProxySessionIndex[]): UnifiedSession[] {
   const TOLERANCE_MS = 10 * 60 * 1000; // 10-minute overlap tolerance
   const used = new Set<string>();
+  const otelById = new Map(otelSessions.map((o) => [o.id, o]));
 
   const unified: UnifiedSession[] = proxySessions.map((proxy): UnifiedSession => {
-    const pStart = new Date(proxy.firstTs).getTime() - TOLERANCE_MS;
-    const pEnd = new Date(proxy.lastTs).getTime() + TOLERANCE_MS;
-    const matched = otelSessions.find((o) => {
-      if (used.has(o.id)) return false;
-      const oStart = new Date(o.firstTs).getTime();
-      const oEnd = new Date(o.lastTs).getTime();
-      return Math.max(pStart, oStart) <= Math.min(pEnd, oEnd);
-    });
+    // Exact sessionId match first -- proxy.id is the real sessionId (see
+    // segmentProxySessions), which OTEL sessions carry too for non-legacy
+    // traffic. Only fall back to time-overlap guessing for legacy proxy
+    // entries grouped by ts (no sessionId was ever logged).
+    let matched = otelById.get(proxy.id);
+    if (matched && used.has(matched.id)) matched = undefined;
+    if (!matched) {
+      const pStart = new Date(proxy.firstTs).getTime() - TOLERANCE_MS;
+      const pEnd = new Date(proxy.lastTs).getTime() + TOLERANCE_MS;
+      matched = otelSessions.find((o) => {
+        if (used.has(o.id)) return false;
+        const oStart = new Date(o.firstTs).getTime();
+        const oEnd = new Date(o.lastTs).getTime();
+        return Math.max(pStart, oStart) <= Math.min(pEnd, oEnd);
+      });
+    }
     if (matched) used.add(matched.id);
 
     return {
