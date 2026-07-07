@@ -7,6 +7,8 @@ import {
   segmentProxySessions,
   resolveProxySessionMessages,
   deriveMessageTimestamps,
+  classifyFinding,
+  classifyPatternType,
   type ProxyIndexEntry,
   type ProxySessionIndex,
 } from "./proxyLog.js";
@@ -559,10 +561,10 @@ function aggregateSecurityStats(auditEntries: AuditEntryEnriched[], proxyEntries
     byMonth[month] = (byMonth[month] ?? 0) + 1;
     for (const m of e.matches) {
       byMatchType[m.type] = (byMatchType[m.type] ?? 0) + 1;
-      if (m.type.startsWith("api_key_") && e.decision === "block") {
+      if (classifyPatternType(m.type) === "secrets" && e.decision === "block") {
         secretsBlocked++;
         recentBlocked.push({ sessionId: e.sessionId, ts: e.ts, scannerId: m.type });
-      } else if (m.type.startsWith("pii_")) {
+      } else if (classifyPatternType(m.type) === "pii") {
         piiNoise++;
       }
     }
@@ -582,8 +584,9 @@ function aggregateSecurityStats(auditEntries: AuditEntryEnriched[], proxyEntries
     for (const f of pe.findings ?? []) {
       proxyFindingsBySeverity[f.severity] = (proxyFindingsBySeverity[f.severity] ?? 0) + 1;
       proxyFindingsByScanner[f.scannerId] = (proxyFindingsByScanner[f.scannerId] ?? 0) + 1;
-      if (f.scannerId.startsWith("privacy/api_key")) secretsTokenizedInFlight++;
-      else if (f.scannerId.startsWith("privacy/pii")) piiNoise++;
+      const cat = classifyFinding(f.scannerId);
+      if (cat === "secrets") secretsTokenizedInFlight++;
+      else if (cat === "pii") piiNoise++;
     }
   }
 
@@ -1242,8 +1245,9 @@ async function loadSession(id, target) {
   const evts = data.source==='otel' ? data.events : (data.otelEvents||[]);
   const toolCnt = evts.filter(e=>e.kind==='tool').length + countProxyToolCards(data.messages);
   const hookCnt = evts.filter(e=>e.kind==='hook').length;
-  const secFindings = data.findings ?? [];
-  const secretsFindings = secFindings.filter(f=>f.scannerId.startsWith('privacy/api_key'));
+  const allFindings = data.findings ?? [];
+  const secFindings = allFindings.filter(f=>f.category==='finding');
+  const secretsFindings = allFindings.filter(f=>f.category==='secrets');
   const secDecision = data.securityDecision ?? 'allow';
   const secBadge = secFindings.length > 0
     ? (secDecision==='block'
@@ -1572,9 +1576,10 @@ function renderAtlasBadge(technique) {
 }
 
 function renderSecurityFindings(findings) {
-  if (!findings || findings.length === 0) return '';
+  const onlyFindings = (findings || []).filter(f => f.category === 'finding');
+  if (onlyFindings.length === 0) return '';
   const byScanner = {};
-  for (const f of findings) {
+  for (const f of onlyFindings) {
     if (!byScanner[f.scannerId]) byScanner[f.scannerId] = { ...f, count: 0 };
     byScanner[f.scannerId].count++;
   }
@@ -1590,9 +1595,9 @@ function renderSecurityFindings(findings) {
 }
 
 function renderMatchTypeBadge(type) {
-  const isKey = type.startsWith('api_key_');
-  const cls = isKey ? 'mt-badge mt-key' : 'mt-badge mt-pii';
-  const label = isKey ? '🔑 '+type.replace('api_key_','') : '📋 '+type.replace('pii_','');
+  const isPii = type.startsWith('pii_');
+  const cls = isPii ? 'mt-badge mt-pii' : 'mt-badge mt-key';
+  const label = isPii ? '📋 '+type.replace('pii_','') : '🔑 '+type.replace('api_key_','');
   return '<span class="'+cls+'">'+esc(label)+'</span>';
 }
 
@@ -1660,7 +1665,8 @@ function renderProxyMessage(msg, callMap, ts, idx, findings) {
   const covering = (Number.isInteger(idx) && Array.isArray(findings))
     ? findings.filter(f => idx >= f.fromMessageIndex && idx <= f.toMessageIndex)
     : [];
-  const secretsCovering = covering.filter(f => f.scannerId.startsWith('privacy/api_key'));
+  const findingsCovering = covering.filter(f => f.category === 'finding');
+  const secretsCovering = covering.filter(f => f.category === 'secrets');
   // A message can be covered by many findings at once (esp. after collapsing a
   // whole burst of short proxy log entries into one message range) -- render one
   // visible glyph per category with a ×N count, not one stacked span per finding.
@@ -1676,7 +1682,7 @@ function renderProxyMessage(msg, callMap, ts, idx, findings) {
     ).join('');
     return visible + hidden;
   };
-  const markerHtml = markerGroup(covering, 'findings', '🛡') + markerGroup(secretsCovering, 'secrets', '🔑');
+  const markerHtml = markerGroup(findingsCovering, 'findings', '🛡') + markerGroup(secretsCovering, 'secrets', '🔑');
   return '<div class="msg '+msg.role+'">'+
     '<div class="msg-role">'+msg.role+sourceLabel+tsHtml+markerHtml+'</div>'+
     '<div class="bubble">'+bodyHtml+'</div></div>';

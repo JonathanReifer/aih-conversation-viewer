@@ -86,7 +86,10 @@ describe("proxyLog: golden-diff — index + hydrate reproduces the pre-split beh
     expect(s.id).toBe("s1");
     expect(s.model).toBe("claude-sonnet-5");
     expect(s.messageCount).toBe(2);
-    expect(s.piiCount).toBe(3);
+    // piiCount/secretsCount are derived from classifyFinding(scannerId), not
+    // matchCount -- this fixture has no findings array at all, so both are 0.
+    expect(s.piiCount).toBe(0);
+    expect(s.secretsCount).toBe(0);
     expect(s.firstPrompt).toBe("first user prompt");
     expect(s.securityDecision).toBeUndefined();
 
@@ -102,7 +105,7 @@ describe("proxyLog: golden-diff — index + hydrate reproduces the pre-split beh
     ]);
   });
 
-  test("multi-entry session (within gap window): groups, picks longest as bestRef, sums piiCount, worst-cases decision", () => {
+  test("multi-entry session (within gap window): groups, picks longest as bestRef, classifies findings by category, worst-cases decision", () => {
     const base = new Date("2026-06-01T10:00:00.000Z").getTime();
     swapFixture([
       {
@@ -117,7 +120,7 @@ describe("proxyLog: golden-diff — index + hydrate reproduces the pre-split beh
         sessionId: "s1",
         matchCount: 2,
         decision: "block",
-        findings: [{ scannerId: "secrets", description: "found an api key", severity: "block" }],
+        findings: [{ scannerId: "privacy/api_key_github", description: "found an api key", severity: "block" }],
         model: "claude-opus-4-8",
         tokenized: ["longer turn 2 with more content", "longer reply 2 with more content", "third turn", "third reply"],
       },
@@ -131,7 +134,10 @@ describe("proxyLog: golden-diff — index + hydrate reproduces the pre-split beh
     // "best" = longest tokenized array -> the second entry.
     expect(s.messageCount).toBe(4);
     expect(s.model).toBe("claude-opus-4-8");
-    expect(s.piiCount).toBe(3); // 1 + 2
+    // piiCount/secretsCount come from classifyFinding(scannerId), not matchCount --
+    // "privacy/api_key_github" classifies as "secrets", not "pii".
+    expect(s.piiCount).toBe(0);
+    expect(s.secretsCount).toBe(1);
     expect(s.securityDecision).toBe("block");
     expect(s.findings).toHaveLength(1);
     // The finding was raised on the second entry (tokenizedLength 4), whose
@@ -139,6 +145,7 @@ describe("proxyLog: golden-diff — index + hydrate reproduces the pre-split beh
     expect(s.findings![0].fromMessageIndex).toBe(2);
     expect(s.findings![0].toMessageIndex).toBe(3);
     expect(s.findings![0].ts).toBe(new Date(base + 5 * 60_000).toISOString());
+    expect(s.findings![0].category).toBe("secrets");
 
     expect(s.entryTimestamps).toEqual([
       { ts: new Date(base).toISOString(), tokenizedLength: 2 },

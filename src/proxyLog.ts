@@ -12,6 +12,32 @@ export type ProxyLogFinding = {
   owaspCategory?: string;
 };
 
+// Three disjoint buckets for a ProxyLogFinding, by scannerId:
+// - "pii": privacy/pii_* -- a PII pattern got tokenized
+// - "secrets": every other privacy/* scannerId except privacy/orphaned-token
+//   (api keys, ssh/tls private keys, db connection strings, jwts, npm tokens,
+//   etc.) -- a non-PII secret got tokenized
+// - "finding": everything else -- genuine detections (ATLAS/OWASP
+//   injection/adversarial scanners) plus privacy/orphaned-token (an
+//   un-detokenized token leaking into a response, not itself a tokenized-secret
+//   pattern match)
+export type FindingCategory = "pii" | "secrets" | "finding";
+
+export function classifyFinding(scannerId: string): FindingCategory {
+  if (scannerId.startsWith("privacy/pii")) return "pii";
+  if (scannerId.startsWith("privacy/") && scannerId !== "privacy/orphaned-token") return "secrets";
+  return "finding";
+}
+
+// Same pii/secrets split as classifyFinding, but for the audit.jsonl data
+// source (aih-privacy-middleware's hook-based match records), which carries
+// bare PatternType strings (e.g. "api_key_github", "ssh_private_key",
+// "pii_email") with no "privacy/" scannerId prefix and no genuine-finding
+// types mixed in -- so it's a two-way split, not three-way.
+export function classifyPatternType(type: string): "pii" | "secrets" {
+  return type.startsWith("pii_") ? "pii" : "secrets";
+}
+
 // Shape of a raw JSONL line on disk. Only ever materialized transiently —
 // during ingest (to build the index entry) or during on-demand hydration
 // (to extract `tokenized` for one requested session) — never held resident.
@@ -68,6 +94,7 @@ export type ProxySessionFinding = ProxyLogFinding & {
   fromMessageIndex: number;
   toMessageIndex: number;
   ts: string;
+  category: FindingCategory;
 };
 
 export type ProxySessionIndex = {
@@ -77,6 +104,7 @@ export type ProxySessionIndex = {
   model: string;
   messageCount: number;
   piiCount: number;
+  secretsCount: number;
   firstPrompt: string;
   findings?: ProxySessionFinding[];
   securityDecision?: "allow" | "ask" | "block";
@@ -203,10 +231,14 @@ export function segmentProxySessions(startTs?: string, endTs?: string): ProxySes
       const from = Math.min(prevLength, maxIdx);
       const to = Math.min(Math.max(from, e.tokenizedLength - 1), maxIdx);
       if (e.findings) {
-        for (const f of e.findings) allFindings.push({ ...f, fromMessageIndex: from, toMessageIndex: to, ts: e.ts });
+        for (const f of e.findings) {
+          allFindings.push({ ...f, fromMessageIndex: from, toMessageIndex: to, ts: e.ts, category: classifyFinding(f.scannerId) });
+        }
       }
       prevLength = e.tokenizedLength;
     }
+    const piiCount = allFindings.filter(f => f.category === "pii").length;
+    const secretsCount = allFindings.filter(f => f.category === "secrets").length;
 
     const worstDecision = group.reduce((worst: "allow" | "ask" | "block", e) => {
       if (e.decision === "block" || worst === "block") return "block";
@@ -219,7 +251,8 @@ export function segmentProxySessions(startTs?: string, endTs?: string): ProxySes
       lastTs: sorted[sorted.length - 1].ts,
       model: best.model ?? "unknown",
       messageCount: best.tokenizedLength,
-      piiCount: group.reduce((n, e) => n + e.matchCount, 0),
+      piiCount,
+      secretsCount,
       firstPrompt: best.firstPromptFragment,
       entryTimestamps,
       ...(allFindings.length > 0 ? { findings: allFindings, securityDecision: worstDecision } : {}),
