@@ -1471,8 +1471,8 @@ function renderToolBody(toolName, input, resultText) {
   if (n==='bash') {
     // tool_result uses "command"; tool_parameters (blocked/not-executed) uses "bash_command"/"full_command"
     const cmd = i.command || i.full_command || i.bash_command;
-    if (cmd) sections.push(['Command', String(cmd)]);
     if (i.description) sections.push(['Description', String(i.description)]);
+    if (cmd) sections.push(['Command', String(cmd)]);
   } else if (n==='read') {
     if (i.file_path) sections.push(['File', String(i.file_path)]);
     if (i.offset!=null) sections.push(['Offset', String(i.offset)]);
@@ -1667,6 +1667,7 @@ function renderProxyMessage(msg, callMap, ts, idx, findings) {
     : [];
   const findingsCovering = covering.filter(f => f.category === 'finding');
   const secretsCovering = covering.filter(f => f.category === 'secrets');
+  const piiCovering = covering.filter(f => f.category === 'pii');
   // A message can be covered by many findings at once (esp. after collapsing a
   // whole burst of short proxy log entries into one message range) -- render one
   // visible glyph per category with a ×N count, not one stacked span per finding.
@@ -1682,7 +1683,7 @@ function renderProxyMessage(msg, callMap, ts, idx, findings) {
     ).join('');
     return visible + hidden;
   };
-  const markerHtml = markerGroup(findingsCovering, 'findings', '🛡') + markerGroup(secretsCovering, 'secrets', '🔑');
+  const markerHtml = markerGroup(findingsCovering, 'findings', '🛡') + markerGroup(secretsCovering, 'secrets', '🔑') + markerGroup(piiCovering, 'pii', '🔒');
   return '<div class="msg '+msg.role+'">'+
     '<div class="msg-role">'+msg.role+sourceLabel+tsHtml+markerHtml+'</div>'+
     '<div class="bubble">'+bodyHtml+'</div></div>';
@@ -1820,6 +1821,13 @@ function clearSearchHighlights() {
   document.querySelectorAll('mark.search-hit,mark.search-active').forEach(m => {
     m.replaceWith(document.createTextNode(m.textContent));
   });
+  // Unwrapping a mark leaves its text as a new sibling node, still split from
+  // the text before/after it -- without merging these back into one node, a
+  // shorter previous query (e.g. "a" while typing "assistant" letter by
+  // letter) permanently fragments the tree at each match boundary, so the
+  // next, longer query's substring can straddle a node split and find nothing
+  // even though the text is fully visible.
+  document.getElementById('thread').normalize();
 }
 
 function runSearch(q) {
@@ -1919,6 +1927,23 @@ function populateCategoryHits() {
   categoryHits.secrets = [...document.querySelectorAll('[data-cat="secrets"]:not(.badge)')];
   categoryHits.findings = [...document.querySelectorAll('[data-cat="findings"]:not(.badge)')];
   categoryHits.audit = [...document.querySelectorAll('[data-cat="audit"]:not(.badge)')];
+  // Server-detected PII (data-cat="pii" markers, populated the same way as
+  // secrets/findings) plus any raw PII scanPii() still finds client-side --
+  // the latter only fires when text wasn't already tokenized upstream (e.g.
+  // a degraded scanner), so it's a supplement, not the primary source.
+  categoryHits.pii = [...document.querySelectorAll('[data-cat="pii"]:not(.badge), mark.pii-hit')];
+}
+
+// A category hit can land inside a collapsed .tool-body (e.g. a PII match in
+// a Bash command's arguments) -- scrollIntoView on a display:none ancestor
+// silently no-ops, so the jump looks like nothing happened. Expand every
+// collapsed tool-body ancestor before scrolling.
+function expandAncestors(el) {
+  for (let p = el.parentElement; p; p = p.parentElement) {
+    if (p.classList.contains('tool-body') && !p.classList.contains('open')) {
+      p.classList.add('open');
+    }
+  }
 }
 
 function selectCategory(cat) {
@@ -1939,6 +1964,7 @@ function advanceCategory(dir) {
   const el = hits[categoryIdx[cat]];
   if (!el) return;
   el.classList.add(cat === 'pii' ? 'pii-active' : 'cat-active');
+  expandAncestors(el);
   el.scrollIntoView({block:'center'});
   document.getElementById('cnb-label').textContent = CAT_LABELS[cat] || cat;
   document.getElementById('cnb-count').textContent = (categoryIdx[cat]+1)+' of '+hits.length;
@@ -1978,6 +2004,7 @@ function jumpToTarget(target) {
   categoryIdx[target.cat] = bestIdx;
   const el = hits[bestIdx];
   el.classList.add(target.cat === 'pii' ? 'pii-active' : 'cat-active');
+  expandAncestors(el);
   el.scrollIntoView({block:'center'});
   document.getElementById('cnb-label').textContent = CAT_LABELS[target.cat] || target.cat;
   document.getElementById('cnb-count').textContent = (bestIdx+1)+' of '+hits.length;
