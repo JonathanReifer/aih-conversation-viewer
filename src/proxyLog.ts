@@ -95,6 +95,11 @@ export type ProxySessionFinding = ProxyLogFinding & {
   toMessageIndex: number;
   ts: string;
   category: FindingCategory;
+  // How many raw per-request finding rows collapsed into this one. The proxy
+  // re-scans the whole cumulative snapshot on every request, so a single PII
+  // value re-reports on every subsequent request; without dedup a session
+  // shows thousands of identical findings.
+  occurrences: number;
 };
 
 export type ProxySessionIndex = {
@@ -226,17 +231,29 @@ export function segmentProxySessions(startTs?: string, endTs?: string): ProxySes
     // produces indices beyond the messages array actually served.
     const maxIdx = Math.max(0, best.tokenizedLength - 1);
     let prevLength = 0;
-    const allFindings: ProxySessionFinding[] = [];
+    // Dedup findings to their distinct identity. A finding carries no
+    // per-occurrence value (only scannerId/description/severity), and the proxy
+    // re-scans the cumulative snapshot on every request, so the same match
+    // re-reports across thousands of entries. Collapse to the first occurrence
+    // (kept for jump-to navigation) and count the rest as `occurrences`.
+    const findingByKey = new Map<string, ProxySessionFinding>();
     for (const e of sorted) {
       const from = Math.min(prevLength, maxIdx);
       const to = Math.min(Math.max(from, e.tokenizedLength - 1), maxIdx);
       if (e.findings) {
         for (const f of e.findings) {
-          allFindings.push({ ...f, fromMessageIndex: from, toMessageIndex: to, ts: e.ts, category: classifyFinding(f.scannerId) });
+          const key = `${f.scannerId}|${f.description ?? ""}|${f.severity ?? ""}`;
+          const existing = findingByKey.get(key);
+          if (existing) {
+            existing.occurrences++;
+          } else {
+            findingByKey.set(key, { ...f, fromMessageIndex: from, toMessageIndex: to, ts: e.ts, category: classifyFinding(f.scannerId), occurrences: 1 });
+          }
         }
       }
       prevLength = e.tokenizedLength;
     }
+    const allFindings: ProxySessionFinding[] = Array.from(findingByKey.values());
     const piiCount = allFindings.filter(f => f.category === "pii").length;
     const secretsCount = allFindings.filter(f => f.category === "secrets").length;
 
