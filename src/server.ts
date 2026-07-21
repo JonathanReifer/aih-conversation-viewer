@@ -12,6 +12,14 @@ import {
   type ProxyIndexEntry,
   type ProxySessionIndex,
 } from "./proxyLog.js";
+import {
+  readHarnessEntries,
+  buildHarnessSessions,
+  hydrateRecord,
+  type HarnessSessionIndex,
+} from "./harnessLog.js";
+import { readdirSync, statSync, existsSync } from "node:fs";
+import { join } from "node:path";
 
 const PORT = 4446;
 const LOKI_URL = process.env.LOKI_URL ?? "http://localhost:3100";
@@ -2223,14 +2231,182 @@ setInterval(() => { if (activeView !== 'security') loadSessions(); }, 30000);
 </body>
 </html>`;
 
+// ── Harness endpoints (structural mirror spine) ────────────────────────────
+
+const PROJECTS_ROOT = process.env.CLAUDE_PROJECTS_DIR ?? `${process.env.HOME}/.claude/projects`;
+
+// mirrorLagSeconds: newest native transcript mtime vs newest harness record ts.
+// Walking ~6k files costs a few ms of stat calls; memoized for 30s.
+let mirrorLagMemo: { at: number; lag: number | null } = { at: 0, lag: null };
+function mirrorLagSeconds(newestHarnessTs: string | undefined): number | null {
+  if (Date.now() - mirrorLagMemo.at < 30_000) return mirrorLagMemo.lag;
+  let newestMtime = 0;
+  try {
+    for (const d of readdirSync(PROJECTS_ROOT)) {
+      const dir = join(PROJECTS_ROOT, d);
+      let files: string[] = [];
+      try { files = readdirSync(dir); } catch { continue; }
+      for (const f of files) {
+        if (!f.endsWith(".jsonl")) continue;
+        try {
+          const m = statSync(join(dir, f)).mtimeMs;
+          if (m > newestMtime) newestMtime = m;
+        } catch { /* ignore */ }
+      }
+    }
+  } catch {
+    mirrorLagMemo = { at: Date.now(), lag: null };
+    return null;
+  }
+  const harnessMs = newestHarnessTs ? Date.parse(newestHarnessTs) : 0;
+  const lag = newestMtime > 0 && harnessMs > 0
+    ? Math.max(0, Math.round((newestMtime - harnessMs) / 1000))
+    : null;
+  mirrorLagMemo = { at: Date.now(), lag };
+  return lag;
+}
+
+// Machine-wide rollup — the top zoom level.
+function handleOverview(startTs?: string, endTs?: string): Response {
+  const entries = readHarnessEntries();
+  let sessions = buildHarnessSessions(entries);
+  if (startTs) sessions = sessions.filter((s) => s.lastTs >= startTs);
+  if (endTs) sessions = sessions.filter((s) => s.firstTs <= endTs + "Z");
+
+  const byDay = new Map<string, number>();
+  const byProject = new Map<string, { sessions: number; userTurns: number; toolCalls: number; agents: number }>();
+  const toolTotals = new Map<string, number>();
+  let agentSpawns = 0;
+  let userTurns = 0;
+  let toolCalls = 0;
+  let usageIn = 0;
+  let usageOut = 0;
+  let findingsCount = 0;
+  const now = Date.now();
+  const active: Array<{ id: string; project?: string; lastTs: string; agents: number }> = [];
+
+  for (const s of sessions) {
+    const day = s.lastTs.slice(0, 10);
+    byDay.set(day, (byDay.get(day) ?? 0) + 1);
+    const proj = s.project ?? "unknown";
+    const p = byProject.get(proj) ?? { sessions: 0, userTurns: 0, toolCalls: 0, agents: 0 };
+    p.sessions++;
+    p.userTurns += s.userTurnCount;
+    p.toolCalls += s.toolCallCount;
+    p.agents += s.agents.length;
+    byProject.set(proj, p);
+    for (const [name, n] of Object.entries(s.toolCounts)) toolTotals.set(name, (toolTotals.get(name) ?? 0) + n);
+    agentSpawns += s.agents.length;
+    userTurns += s.userTurnCount;
+    toolCalls += s.toolCallCount;
+    usageIn += s.usageIn;
+    usageOut += s.usageOut;
+    findingsCount += s.findingsCount;
+    if (now - Date.parse(s.lastTs) < 5 * 60_000) {
+      active.push({ id: s.id, project: s.project, lastTs: s.lastTs, agents: s.agents.length });
+    }
+  }
+
+  // Security decisions in-window from the audit stream (exact-join spine).
+  const decisions: Record<string, number> = { allow: 0, ask: 0, block: 0 };
+  for (const a of readAuditEntries(startTs, endTs)) {
+    decisions[a.decision] = (decisions[a.decision] ?? 0) + 1;
+  }
+
+  const topTools = [...toolTotals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15)
+    .map(([name, count]) => ({ name, count }));
+  const projects = [...byProject.entries()].sort((a, b) => b[1].sessions - a[1].sessions)
+    .map(([name, v]) => ({ name, ...v }));
+  const sessionsPerDay = [...byDay.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([date, count]) => ({ date, count }));
+  const newestTs = sessions[0]?.lastTs;
+
+  return Response.json({
+    sessions: sessions.length,
+    userTurns,
+    toolCalls,
+    agentSpawns,
+    usage: { in: usageIn, out: usageOut },
+    findingsCount,
+    decisions,
+    sessionsPerDay,
+    projects,
+    topTools,
+    activeSessions: active,
+    mirrorLagSeconds: mirrorLagSeconds(newestTs),
+  });
+}
+
+// Agent tree + turn DAG for one session — index tier only, cheap at 5k nodes.
+function handleSessionGraph(id: string): Response {
+  const sessions = buildHarnessSessions(readHarnessEntries());
+  const s = sessions.find((x) => x.id === id);
+  if (!s) return new Response("Not Found", { status: 404 });
+  const nodes = [...s.nodeRefs.values()].map((n) => ({
+    uuid: n.uuid,
+    parentUuid: n.parentUuid ?? null,
+    role: n.role,
+    ts: n.ts,
+    agentId: n.agentId ?? null,
+    findingsCount: n.findingsCount ?? 0,
+  }));
+  const toolEdges = [...s.toolCallRefs.values()].map((t) => ({
+    toolUseId: t.toolUseId,
+    name: t.name,
+    callerUuid: t.callerUuid,
+    ts: t.ts,
+    agentId: t.agentId ?? null,
+    success: s.toolResultRefs.get(t.toolUseId!)?.success,
+    resultSizeBytes: s.toolResultRefs.get(t.toolUseId!)?.sizeBytes,
+  }));
+  return Response.json({
+    id: s.id,
+    project: s.project,
+    firstTs: s.firstTs,
+    lastTs: s.lastTs,
+    agents: s.agents,
+    nodes,
+    toolEdges,
+  });
+}
+
+// Drill endpoint: hydrate one node + its tool calls/results + audit verdicts.
+// (OTEL per-node cost/decision join lands in P4.)
+function handleSessionTurn(id: string, uuid: string): Response {
+  const sessions = buildHarnessSessions(readHarnessEntries());
+  const s = sessions.find((x) => x.id === id);
+  if (!s) return new Response("Not Found", { status: 404 });
+  const ref = s.nodeRefs.get(uuid);
+  if (!ref) return new Response("Not Found", { status: 404 });
+  const node = hydrateRecord(ref);
+  if (!node) return new Response("Gone (rotated)", { status: 410 });
+
+  const tools: Record<string, unknown>[] = [];
+  for (const t of s.toolCallRefs.values()) {
+    if (t.callerUuid !== uuid) continue;
+    const call = hydrateRecord(t);
+    if (!call) continue;
+    const resRef = s.toolResultRefs.get(t.toolUseId!);
+    const result = resRef ? hydrateRecord(resRef) : null;
+    tools.push({ call, result });
+  }
+  // Audit verdicts: exact sessionId join, scoped to ±5 min of the node ts.
+  const nodeMs = Date.parse(ref.ts);
+  const audit = readAuditEntries()
+    .filter((a) => a.sessionId === id && Math.abs(Date.parse(a.ts) - nodeMs) < 5 * 60_000)
+    .map(enrichAuditEntry);
+  return Response.json({ sessionId: id, node, tools, audit });
+}
+
 // ── Router ─────────────────────────────────────────────────────────────────
 
 {
   const warmStart = performance.now();
   const proxyCount = readProxyEntries().length;
   const auditCount = readAuditEntries().length;
+  const harnessCount = readHarnessEntries().length;
   const elapsedMs = Math.round(performance.now() - warmStart);
-  console.log(`[logCache] pre-warm: ${proxyCount} proxy entries, ${auditCount} audit entries in ${elapsedMs}ms`);
+  console.log(`[logCache] pre-warm: ${proxyCount} proxy entries, ${auditCount} audit entries, ${harnessCount} harness entries in ${elapsedMs}ms`);
 }
 
 Bun.serve({
@@ -2244,8 +2420,16 @@ Bun.serve({
     if (url.pathname === "/api/sessions") {
       return handleSessions(source, url.searchParams.get("user") ?? undefined, startTs, endTs, url.searchParams.get("project") ?? undefined);
     }
+    if (url.pathname === "/api/overview") {
+      return handleOverview(startTs, endTs);
+    }
     if (url.pathname.startsWith("/api/sessions/")) {
-      return handleSession(decodeURIComponent(url.pathname.slice(14)), source, startTs, endTs);
+      const rest = decodeURIComponent(url.pathname.slice(14));
+      const graphMatch = rest.match(/^([^/]+)\/graph$/);
+      if (graphMatch) return handleSessionGraph(graphMatch[1]);
+      const turnMatch = rest.match(/^([^/]+)\/turns\/([^/]+)$/);
+      if (turnMatch) return handleSessionTurn(turnMatch[1], turnMatch[2]);
+      return handleSession(rest, source, startTs, endTs);
     }
     if (url.pathname === "/api/security/stats") {
       return handleSecurityStats(startTs, endTs);
